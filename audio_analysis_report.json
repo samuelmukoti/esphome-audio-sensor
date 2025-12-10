@@ -1,0 +1,40 @@
+{
+  "file_info": {
+    "filename": "/Users/sam/tmp/esphome-audio-sensor/analysis_temp.wav",
+    "sample_rate_hz": 48000,
+    "duration_s": 0.08000000000000007,
+    "channels": 1,
+    "bit_depth": 16
+  },
+  "amplitude": {
+    "peak": 0.088592529296875,
+    "mean": 0.00230082756470838,
+    "rms": 0.004148195386262139,
+    "peak_db": -21.052057982560886,
+    "rms_db": -47.642815917516
+  },
+  "beep_pattern": {
+    "num_beeps": 10,
+    "avg_duration_s": 0.08200000000000002,
+    "min_duration_s": 0.040000000000000036,
+    "max_duration_s": 0.10000000000000009,
+    "avg_interval_s": 0.7777777777777778,
+    "pattern_regular": false
+  },
+  "signal_quality": {
+    "noise_floor": 0.002743663746469427,
+    "signal_level": 0.0118549452529406,
+    "snr_db": 12.711373359640774,
+    "quality": "MODERATE"
+  },
+  "detection_parameters": {
+    "amplitude_threshold": 0.0068565489653057065,
+    "window_size_ms": 100,
+    "hop_size_ms": 20,
+    "min_duration_ms": 28.000000000000025,
+    "bandpass_low_hz": 300,
+    "bandpass_high_hz": 140.625,
+    "primary_frequency_hz": 93.75
+  },
+  "recommended_approach": "Bandpass filter + pattern matching recommended"
+}
