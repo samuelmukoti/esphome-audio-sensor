@@ -4,6 +4,15 @@ esphome:
   min_version: 2025.9.0
   name_add_mac_suffix: false
 
+# Load custom beep_detector component from GitHub
+external_components:
+  - source:
+      type: git
+      url: https://github.com/samuelmukoti/esphome-audio-sensor
+      ref: main
+    components: [beep_detector]
+    refresh: 0s
+
 esp32:
   variant: esp32
   framework:
@@ -11,6 +20,10 @@ esp32:
 
 # Enable logging
 logger:
+  level: DEBUG  # Set to INFO in production
+  logs:
+    beep_detector: DEBUG
+    i2s_audio: DEBUG
 
 # Enable Home Assistant API
 api:
@@ -22,3 +35,53 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+
+# I2S Microphone Configuration (M5Stack Atom Echo SPM1423)
+i2s_audio:
+  - id: i2s_mic_bus
+    i2s_lrclk_pin: GPIO33
+    i2s_bclk_pin: GPIO19
+
+microphone:
+  - platform: i2s_audio
+    id: echo_microphone
+    i2s_audio_id: i2s_mic_bus
+    i2s_din_pin: GPIO23
+    adc_type: external
+    pdm: true
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    channel: left
+
+# Beep Detector Component
+beep_detector:
+  id: beep_detector_component
+  microphone: echo_microphone
+
+  # Detection Parameters (based on audio analysis)
+  target_frequency: 2615.0  # Hz - primary beep frequency
+  sample_rate: 16000         # Hz - must match microphone
+  window_size: 100           # ms - analysis window
+  energy_threshold: 100.0    # Goertzel energy threshold (tune this)
+  rms_threshold: 0.0069      # RMS amplitude threshold
+  min_duration: 40           # ms - minimum beep duration
+  max_duration: 100          # ms - maximum beep duration
+  cooldown: 200              # ms - cooldown after detection
+  debounce_count: 2          # consecutive detections required
+
+  # Binary sensor for beep detection state
+  binary_sensor:
+    name: "Beep Detected"
+    device_class: sound
+    filters:
+      - delayed_off: 100ms  # Keep state ON briefly for visibility
+
+  # Diagnostic sensors for tuning
+  energy_sensor:
+    name: "Beep Energy Level"
+
+  rms_sensor:
+    name: "Audio RMS Level"
+
+  detection_count:
+    name: "Total Beep Detections"
