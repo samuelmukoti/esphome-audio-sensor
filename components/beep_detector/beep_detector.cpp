@@ -1,5 +1,6 @@
 #include "beep_detector.h"
 #include "esphome/core/log.h"
+#include "esphome/core/hal.h"
 
 namespace esphome {
 namespace beep_detector {
@@ -36,9 +37,12 @@ void BeepDetectorComponent::setup() {
 
   // Register data callback with microphone
   if (this->microphone_ != nullptr) {
-    this->microphone_->add_data_callback([this](const std::vector<int16_t> &data) {
-      // Add incoming samples to our buffer
-      this->audio_buffer_.insert(this->audio_buffer_.end(), data.begin(), data.end());
+    this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
+      // Convert uint8_t bytes to int16_t samples (little-endian)
+      for (size_t i = 0; i + 1 < data.size(); i += 2) {
+        int16_t sample = (int16_t)((data[i + 1] << 8) | data[i]);
+        this->audio_buffer_.push_back(sample);
+      }
     });
     this->microphone_->start();
   }
