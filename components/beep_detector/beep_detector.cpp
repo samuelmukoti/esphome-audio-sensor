@@ -52,7 +52,7 @@ void BeepDetectorComponent::setup() {
 }
 
 void BeepDetectorComponent::loop() {
-  if (this->microphone_ == nullptr) {
+  if (this->microphone_ == nullptr || !this->enabled_) {
     return;
   }
 
@@ -228,6 +228,47 @@ void BeepDetectorComponent::update_state_machine() {
       }
       break;
   }
+}
+
+void BeepDetectorComponent::recalculate_coefficients() {
+  // Recalculate Goertzel coefficients for new target frequency
+  float k = 0.5f + ((float)this->samples_per_window_ * this->target_frequency_ / (float)this->sample_rate_);
+  float omega = (2.0f * M_PI * k) / (float)this->samples_per_window_;
+  this->coeff_ = 2.0f * cosf(omega);
+  this->sin_val_ = sinf(omega);
+  this->cos_val_ = cosf(omega);
+  ESP_LOGI(TAG, "Recalculated coefficients for %.1f Hz (coeff=%.6f)", this->target_frequency_, this->coeff_);
+}
+
+void BeepDetectorComponent::set_energy_threshold_runtime(float threshold) {
+  this->energy_threshold_ = threshold;
+  ESP_LOGI(TAG, "Energy threshold set to %.4f", threshold);
+}
+
+void BeepDetectorComponent::set_rms_threshold_runtime(float threshold) {
+  this->rms_threshold_ = threshold;
+  ESP_LOGI(TAG, "RMS threshold set to %.6f", threshold);
+}
+
+void BeepDetectorComponent::set_target_frequency_runtime(float freq) {
+  this->target_frequency_ = freq;
+  this->recalculate_coefficients();
+}
+
+void BeepDetectorComponent::set_enabled(bool enabled) {
+  this->enabled_ = enabled;
+  ESP_LOGI(TAG, "Beep detection %s", enabled ? "ENABLED" : "DISABLED");
+  if (!enabled && this->binary_sensor_ != nullptr) {
+    this->binary_sensor_->publish_state(false);
+  }
+}
+
+void BeepDetectorComponent::reset_detection_count() {
+  this->total_detections_ = 0;
+  if (this->detection_count_sensor_ != nullptr) {
+    this->detection_count_sensor_->publish_state(0);
+  }
+  ESP_LOGI(TAG, "Detection count reset to 0");
 }
 
 }  // namespace beep_detector

@@ -62,8 +62,8 @@ beep_detector:
   target_frequency: 2615.0  # Hz - primary beep frequency
   sample_rate: 16000         # Hz - must match microphone
   window_size: 100           # ms - analysis window
-  energy_threshold: 100.0    # Goertzel energy threshold (tune this)
-  rms_threshold: 0.0069      # RMS amplitude threshold
+  energy_threshold: 0.01     # Goertzel energy threshold (lowered for testing)
+  rms_threshold: 0.01        # RMS amplitude threshold (raised above ambient ~0.04)
   min_duration: 40           # ms - minimum beep duration
   max_duration: 100          # ms - maximum beep duration
   cooldown: 200              # ms - cooldown after detection
@@ -85,3 +85,88 @@ beep_detector:
 
   detection_count:
     name: "Total Beep Detections"
+
+# ============================================
+# Runtime Tuning Controls (adjustable from HA)
+# ============================================
+
+switch:
+  - platform: template
+    name: "Beep Detection Enabled"
+    id: beep_detection_enabled
+    icon: "mdi:ear-hearing"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: 'id(beep_detector_component).set_enabled(true);'
+    turn_off_action:
+      - lambda: 'id(beep_detector_component).set_enabled(false);'
+
+button:
+  - platform: template
+    name: "Reset Detection Count"
+    icon: "mdi:counter"
+    on_press:
+      - lambda: 'id(beep_detector_component).reset_detection_count();'
+
+  - platform: restart
+    name: "Restart Device"
+
+number:
+  # Energy Threshold - Primary detection sensitivity
+  - platform: template
+    name: "Energy Threshold"
+    id: energy_threshold_slider
+    icon: "mdi:tune-vertical"
+    unit_of_measurement: ""
+    mode: slider
+    min_value: 0.0001
+    max_value: 10.0
+    step: 0.001
+    initial_value: 0.01
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: 'id(beep_detector_component).set_energy_threshold_runtime(x);'
+
+  # RMS Threshold - Amplitude gate
+  - platform: template
+    name: "RMS Threshold"
+    id: rms_threshold_slider
+    icon: "mdi:volume-high"
+    unit_of_measurement: ""
+    mode: slider
+    min_value: 0.001
+    max_value: 0.5
+    step: 0.001
+    initial_value: 0.01
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: 'id(beep_detector_component).set_rms_threshold_runtime(x);'
+
+  # Target Frequency - For detecting different beep tones
+  - platform: template
+    name: "Target Frequency"
+    id: target_frequency_slider
+    icon: "mdi:sine-wave"
+    unit_of_measurement: "Hz"
+    mode: slider
+    min_value: 500
+    max_value: 5000
+    step: 10
+    initial_value: 2615
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: 'id(beep_detector_component).set_target_frequency_runtime(x);'
+
+# Device diagnostics
+sensor:
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s

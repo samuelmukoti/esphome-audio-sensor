@@ -23,7 +23,7 @@ class BeepDetectorComponent : public Component {
   void loop() override;
   float get_setup_priority() const override { return setup_priority::DATA; }
 
-  // Configuration setters
+  // Configuration setters (used at setup time)
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
   void set_binary_sensor(binary_sensor::BinarySensor *sensor) { this->binary_sensor_ = sensor; }
   void set_energy_sensor(sensor::Sensor *sensor) { this->energy_sensor_ = sensor; }
@@ -40,6 +40,24 @@ class BeepDetectorComponent : public Component {
   void set_cooldown_ms(uint32_t ms) { this->cooldown_ms_ = ms; }
   void set_debounce_count(uint8_t count) { this->debounce_count_ = count; }
 
+  // Runtime setters (can be called from HA to tune parameters)
+  void set_energy_threshold_runtime(float threshold);
+  void set_rms_threshold_runtime(float threshold);
+  void set_target_frequency_runtime(float freq);
+  void set_enabled(bool enabled);
+  void reset_detection_count();
+
+  // Getters (for HA number entities to read current values)
+  float get_energy_threshold() const { return this->energy_threshold_; }
+  float get_rms_threshold() const { return this->rms_threshold_; }
+  float get_target_frequency() const { return this->target_frequency_; }
+  uint32_t get_min_duration_ms() const { return this->min_duration_ms_; }
+  uint32_t get_max_duration_ms() const { return this->max_duration_ms_; }
+  uint32_t get_cooldown_ms() const { return this->cooldown_ms_; }
+  uint8_t get_debounce_count() const { return this->debounce_count_; }
+  bool is_enabled() const { return this->enabled_; }
+  uint32_t get_total_detections() const { return this->total_detections_; }
+
  protected:
   // Core processing
   void process_audio_data();
@@ -47,6 +65,7 @@ class BeepDetectorComponent : public Component {
   float calculate_rms(const int16_t *samples, size_t count);
   bool detect_beep(float energy, float rms);
   void update_state_machine();
+  void recalculate_coefficients();
 
   // Components
   microphone::Microphone *microphone_{nullptr};
@@ -78,6 +97,7 @@ class BeepDetectorComponent : public Component {
   uint32_t cooldown_start_time_{0};
   uint8_t consecutive_detections_{0};
   uint32_t total_detections_{0};
+  bool enabled_{true};
 
   // Audio buffer
   std::vector<int16_t> audio_buffer_;
