@@ -10,7 +10,7 @@ external_components:
       type: git
       url: https://github.com/samuelmukoti/esphome-audio-sensor
       ref: main
-    components: [beep_detector]
+    components: [beep_detector, audio_streamer]
     refresh: 0s
 
 esp32:
@@ -95,6 +95,19 @@ beep_detector:
     name: "Total Beep Detections"
 
 # ============================================
+# Audio Streaming for Debugging
+# ============================================
+# Streams raw audio over UDP to a Python server for analysis
+# Set target_ip to your computer's IP address running audio_server.py
+audio_streamer:
+  id: audio_stream_component
+  microphone: echo_microphone
+  target_ip: "192.168.1.100"  # CHANGE THIS to your computer's IP
+  target_port: 5000
+  sample_rate: 16000
+  enabled: false  # Start disabled, enable from HA when needed
+
+# ============================================
 # Runtime Tuning Controls (adjustable from HA)
 # ============================================
 
@@ -109,6 +122,17 @@ switch:
       - lambda: 'id(beep_detector_component).set_enabled(true);'
     turn_off_action:
       - lambda: 'id(beep_detector_component).set_enabled(false);'
+
+  - platform: template
+    name: "Audio Streaming"
+    id: audio_streaming_enabled
+    icon: "mdi:broadcast"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: 'id(audio_stream_component).start_streaming();'
+    turn_off_action:
+      - lambda: 'id(audio_stream_component).stop_streaming();'
 
 button:
   - platform: template

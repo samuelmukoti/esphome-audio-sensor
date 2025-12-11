@@ -1,0 +1,11 @@
+# Audio Streaming Server Dependencies
+numpy>=1.20.0
+scipy>=1.7.0
+paho-mqtt>=1.6.0
+
+# Optional: for visualization
+matplotlib>=3.4.0
+
+# Optional: for ML experiments
+# scikit-learn>=1.0.0
+# tensorflow>=2.8.0
