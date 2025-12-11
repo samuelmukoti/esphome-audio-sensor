@@ -38,13 +38,35 @@ void BeepDetectorComponent::setup() {
   // Register data callback with microphone
   if (this->microphone_ != nullptr) {
     this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
+      // Debug: log callback activity
+      static uint32_t callback_count = 0;
+      static int16_t max_sample = 0;
+      static int16_t min_sample = 0;
+      callback_count++;
+
       // Convert uint8_t bytes to int16_t samples (little-endian)
       for (size_t i = 0; i + 1 < data.size(); i += 2) {
         int16_t sample = (int16_t)((data[i + 1] << 8) | data[i]);
         this->audio_buffer_.push_back(sample);
+
+        // Track min/max for debug
+        if (sample > max_sample) max_sample = sample;
+        if (sample < min_sample) min_sample = sample;
+      }
+
+      // Log every 100 callbacks (~every second)
+      if (callback_count % 100 == 0) {
+        ESP_LOGD(TAG, "Audio callback #%d: data_size=%d, buffer_size=%d, sample_range=[%d, %d]",
+                 callback_count, data.size(), this->audio_buffer_.size(), min_sample, max_sample);
+        // Reset min/max for next interval
+        min_sample = 0;
+        max_sample = 0;
       }
     });
     this->microphone_->start();
+    ESP_LOGI(TAG, "Microphone started");
+  } else {
+    ESP_LOGE(TAG, "Microphone is NULL - cannot start audio capture!");
   }
 
   this->state_ = IDLE;
