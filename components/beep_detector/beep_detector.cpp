@@ -40,27 +40,35 @@ void BeepDetectorComponent::setup() {
     this->microphone_->add_data_callback([this](const std::vector<uint8_t> &data) {
       // Debug: log callback activity
       static uint32_t callback_count = 0;
-      static int16_t max_sample = 0;
-      static int16_t min_sample = 0;
+      static int16_t max_sample = -32768;
+      static int16_t min_sample = 32767;
+      static float dc_offset = 1400.0f;  // Initial estimate for PDM mic DC bias
       callback_count++;
 
-      // Convert uint8_t bytes to int16_t samples (little-endian)
+      // Convert uint8_t bytes to int16_t samples (little-endian) with DC offset removal
       for (size_t i = 0; i + 1 < data.size(); i += 2) {
-        int16_t sample = (int16_t)((data[i + 1] << 8) | data[i]);
+        int16_t raw_sample = (int16_t)((data[i + 1] << 8) | data[i]);
+
+        // Update DC offset estimate using exponential moving average
+        // Alpha = 0.001 means slow adaptation (filters out audio, keeps DC)
+        dc_offset = dc_offset * 0.999f + (float)raw_sample * 0.001f;
+
+        // Remove DC offset to get AC-coupled audio signal
+        int16_t sample = raw_sample - (int16_t)dc_offset;
         this->audio_buffer_.push_back(sample);
 
-        // Track min/max for debug
+        // Track min/max for debug (after DC removal)
         if (sample > max_sample) max_sample = sample;
         if (sample < min_sample) min_sample = sample;
       }
 
       // Log every 100 callbacks (~every second)
       if (callback_count % 100 == 0) {
-        ESP_LOGD(TAG, "Audio callback #%d: data_size=%d, buffer_size=%d, sample_range=[%d, %d]",
-                 callback_count, data.size(), this->audio_buffer_.size(), min_sample, max_sample);
+        ESP_LOGD(TAG, "Audio callback #%d: buffer=%d, range=[%d, %d], dc_offset=%.0f",
+                 callback_count, this->audio_buffer_.size(), min_sample, max_sample, dc_offset);
         // Reset min/max for next interval
-        min_sample = 0;
-        max_sample = 0;
+        min_sample = 32767;
+        max_sample = -32768;
       }
     });
     this->microphone_->start();
