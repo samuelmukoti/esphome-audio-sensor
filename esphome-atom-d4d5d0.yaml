@@ -77,6 +77,13 @@ beep_detector:
     device_class: sound
     filters:
       - delayed_off: 100ms  # Keep state ON briefly for visibility
+    on_press:
+      # Fire HA event for automations (more reliable than state changes)
+      - homeassistant.event:
+          event: esphome.beep_detected
+          data:
+            device: "m5stack_echo"
+            message: "Beep detected!"
 
   # Diagnostic sensors for tuning
   energy_sensor:
