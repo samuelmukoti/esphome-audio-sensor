@@ -52,8 +52,7 @@ microphone:
     sample_rate: 16000
     bits_per_sample: 16bit
     channel: left
-    use_apll: true           # Better clock accuracy
-    dc_offset_correction: true  # Remove DC bias - CRITICAL for detection!
+    # DC offset removal handled in beep_detector C++ code
 
 # Beep Detector Component
 beep_detector:
