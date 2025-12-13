@@ -332,7 +332,7 @@ void setup() {
   //   id: nn_detection_enabled
   //   icon: mdi:brain
   //   optimistic: true
-  //   restore_mode: RESTORE_DEFAULT_ON
+  //   restore_mode: RESTORE_DEFAULT_OFF
   //   turn_on_action:
   //     then:
   //       - lambda: !lambda |-
@@ -355,7 +355,7 @@ void setup() {
   nn_detection_enabled->set_object_id("nn_beep_detection_enabled");
   nn_detection_enabled->set_disabled_by_default(false);
   nn_detection_enabled->set_icon("mdi:brain");
-  nn_detection_enabled->set_restore_mode(switch_::SWITCH_RESTORE_DEFAULT_ON);
+  nn_detection_enabled->set_restore_mode(switch_::SWITCH_RESTORE_DEFAULT_OFF);
   nn_detection_enabled->set_component_source(LOG_STR("template.switch"));
   App.register_component(nn_detection_enabled);
   automation_id_3 = new Automation<>(nn_detection_enabled->get_turn_off_trigger());
