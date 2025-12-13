@@ -4,14 +4,13 @@ esphome:
   min_version: 2025.9.0
   name_add_mac_suffix: false
 
-# Load custom beep_detector component from GitHub
+# Load custom components from local directory
+# Off-device inference: ESP32 streams audio, server does NN detection, sends result back
 external_components:
   - source:
-      type: git
-      url: https://github.com/samuelmukoti/esphome-audio-sensor
-      ref: main
-    components: [beep_detector_nn]
-    refresh: 0s
+      type: local
+      path: components
+    components: [audio_streamer, detection_receiver]
 
 esp32:
   variant: esp32
@@ -22,7 +21,8 @@ esp32:
 logger:
   level: DEBUG # Set to INFO in production
   logs:
-    beep_detector_nn: DEBUG
+    audio_streamer: DEBUG
+    detection_receiver: DEBUG
     i2s_audio: DEBUG
 
 # Enable Home Assistant API
@@ -31,10 +31,6 @@ api:
 # Allow Over-The-Air updates
 ota:
   - platform: esphome
-
-#wifi:
-#  ssid: !secret wifi_ssid
-#  password: !secret wifi_password
 
 wifi:
   ssid: "Goshen"
@@ -56,23 +52,29 @@ microphone:
     sample_rate: 16000
     bits_per_sample: 16bit
     channel: left
-    # DC offset removal handled in beep_detector C++ code
 
-# Neural Network Beep Detector Component
-# Uses trained CNN model for robust beep detection
-beep_detector_nn:
-  id: beep_detector_nn_component
+# ============================================
+# Off-Device Inference Architecture:
+#   ESP32 --UDP audio--> Server (NN) --UDP detection--> ESP32 --API--> Home Assistant
+# ============================================
+
+# Audio Streamer: Sends microphone audio to server via UDP
+audio_streamer:
+  id: audio_streamer_component
   microphone: echo_microphone
+  target_ip: "192.168.86.40" # Server running audio_server.py (update to your server IP)
+  target_port: 5050 # Server listens on this port
+  sample_rate: 16000
+  chunk_size: 512 # Samples per UDP packet
 
-  # Detection Parameters
-  sample_rate: 16000 # Hz - must match microphone
-  window_size_ms: 250 # ms - analysis window (optimized for ESP32 memory)
-  confidence_threshold: 0.7 # NN confidence threshold (0.0-1.0)
-  debounce_count: 2 # consecutive detections required
+# Detection Receiver: Receives NN detection results from server
+detection_receiver:
+  id: detection_receiver_component
+  port: 5001 # Listen for detection results from server
 
   # Binary sensor for beep detection state
   binary_sensor:
-    name: "Beep Detected (NN)"
+    name: "Beep Detected"
     device_class: sound
     filters:
       - delayed_off: 100ms # Keep state ON briefly for visibility
@@ -90,30 +92,30 @@ beep_detector_nn:
 
   # Detection count
   detection_count:
-    name: "Total Beep Detections (NN)"
+    name: "Total Beep Detections"
 
 # ============================================
-# Runtime Tuning Controls (adjustable from HA)
+# Runtime Controls
 # ============================================
 
 switch:
   - platform: template
-    name: "NN Beep Detection Enabled"
-    id: nn_detection_enabled
-    icon: "mdi:brain"
+    name: "Audio Streaming Enabled"
+    id: streaming_enabled
+    icon: "mdi:microphone"
     optimistic: true
-    restore_mode: ALWAYS_OFF  # ALWAYS start disabled - inference takes 16s and blocks API
+    restore_mode: RESTORE_DEFAULT_ON # Auto-start streaming
     turn_on_action:
-      - lambda: "id(beep_detector_nn_component).set_enabled(true);"
+      - lambda: "id(audio_streamer_component).set_enabled(true);"
     turn_off_action:
-      - lambda: "id(beep_detector_nn_component).set_enabled(false);"
+      - lambda: "id(audio_streamer_component).set_enabled(false);"
 
 button:
   - platform: template
-    name: "Reset NN Detection Count"
+    name: "Reset Detection Count"
     icon: "mdi:counter"
     on_press:
-      - lambda: "id(beep_detector_nn_component).reset_detection_count();"
+      - lambda: "id(detection_receiver_component).reset_detection_count();"
 
   - platform: restart
     name: "Restart Device"

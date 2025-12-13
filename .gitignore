@@ -1,4 +1,55 @@
+# Secrets
 secrets.yaml
-*.txt
+
+# ESPHome build artifacts
+.esphome/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.txt
+!README*.txt
+
+# Training data (large files)
+tools/recordings/
+tools/labeled_data/
+tools/clean_training_data/
+server/recordings/
+
+# Model files (except the base model)
+tools/models/*.keras
+!tools/models/beep_detector.keras
+server/models/*.keras
+!server/models/beep_detector.keras
+
+# Audio files
+*.wav
+*.m4a
+*.mp3
+
+# Temporary files
+*.tmp
+*.bak

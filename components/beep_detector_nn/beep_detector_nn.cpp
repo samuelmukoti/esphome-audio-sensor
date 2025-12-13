@@ -50,6 +50,11 @@ void BeepDetectorNNComponent::setup() {
   this->fft_magnitude_.resize(N_FFT_BINS, 0.0f);
   this->mel_energies_.resize(N_MELS, 0.0f);
 
+  // Initialize FFT work buffer for built-in Cooley-Tukey FFT
+  this->fft_work_buffer_.resize(N_FFT * 2, 0.0f);  // Complex pairs (real, imag)
+  this->fft_initialized_ = true;
+  ESP_LOGD(TAG, "  Built-in FFT initialized for N=%d", N_FFT);
+
   // Initialize mel filterbank (flat array instead of nested vectors)
   this->initialize_mel_filterbank();
 
@@ -216,12 +221,11 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
       }
     }
 
-    // Compute magnitude spectrum (simplified DFT)
+    // Compute magnitude spectrum (FFT - fast!)
     this->compute_magnitude_spectrum(frame, magnitude, frame_length);
 
-    // Feed watchdog and yield every frame to allow API/WiFi tasks
+    // Feed watchdog every frame (no delay needed - FFT is fast)
     App.feed_wdt();
-    delay(1);  // Yield to other tasks
 
     // Apply mel filterbank (using flat array layout)
     for (int m = 0; m < N_MELS; m++) {
@@ -246,27 +250,76 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
 }
 
 void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, float *magnitude, int n) {
-  // Simplified DFT - only compute bins we need for mel filterbank
-  // This is O(N²) but simpler than FFT
+  // Built-in Cooley-Tukey radix-2 FFT - O(n log n) instead of O(n²)
+  // No external library needed, ~100x faster than naive DFT
+
+  if (!this->fft_initialized_) {
+    ESP_LOGE(TAG, "FFT not initialized!");
+    return;
+  }
+
+  float *work = this->fft_work_buffer_.data();
+
+  // Copy signal to work buffer as complex (real, imag pairs)
+  for (int i = 0; i < n; i++) {
+    work[i * 2] = signal[i];      // Real part
+    work[i * 2 + 1] = 0.0f;       // Imaginary part = 0
+  }
+
+  // Bit-reversal permutation
+  int j = 0;
+  for (int i = 0; i < n - 1; i++) {
+    if (i < j) {
+      // Swap complex values at i and j
+      float temp_r = work[i * 2];
+      float temp_i = work[i * 2 + 1];
+      work[i * 2] = work[j * 2];
+      work[i * 2 + 1] = work[j * 2 + 1];
+      work[j * 2] = temp_r;
+      work[j * 2 + 1] = temp_i;
+    }
+    int k = n / 2;
+    while (k <= j) {
+      j -= k;
+      k /= 2;
+    }
+    j += k;
+  }
+
+  // Cooley-Tukey butterfly operations
+  for (int stage = 1; stage < n; stage *= 2) {
+    float angle_step = -M_PI / stage;
+    float w_r = 1.0f;
+    float w_i = 0.0f;
+    float cos_step = cosf(angle_step);
+    float sin_step = sinf(angle_step);
+
+    for (int group = 0; group < stage; group++) {
+      for (int pair = group; pair < n; pair += stage * 2) {
+        int match = pair + stage;
+
+        // Butterfly: (a, b) -> (a + w*b, a - w*b)
+        float t_r = w_r * work[match * 2] - w_i * work[match * 2 + 1];
+        float t_i = w_r * work[match * 2 + 1] + w_i * work[match * 2];
+
+        work[match * 2] = work[pair * 2] - t_r;
+        work[match * 2 + 1] = work[pair * 2 + 1] - t_i;
+        work[pair * 2] += t_r;
+        work[pair * 2 + 1] += t_i;
+      }
+      // Rotate twiddle factor
+      float temp = w_r * cos_step - w_i * sin_step;
+      w_i = w_r * sin_step + w_i * cos_step;
+      w_r = temp;
+    }
+  }
+
+  // Extract magnitude for positive frequencies only
   int half_n = n / 2 + 1;
-
   for (int k = 0; k < half_n; k++) {
-    float real = 0.0f;
-    float imag = 0.0f;
-    float angle_step = -2.0f * M_PI * k / n;
-    float angle = 0.0f;
-    for (int i = 0; i < n; i++) {
-      real += signal[i] * cosf(angle);
-      imag += signal[i] * sinf(angle);
-      angle += angle_step;
-    }
+    float real = work[k * 2];
+    float imag = work[k * 2 + 1];
     magnitude[k] = sqrtf(real * real + imag * imag);
-
-    // Feed watchdog and yield every 8 bins to allow API/WiFi tasks to run
-    if ((k & 0x07) == 0) {
-      App.feed_wdt();
-      delay(1);  // Yield to other tasks (WiFi, API)
-    }
   }
 }
 

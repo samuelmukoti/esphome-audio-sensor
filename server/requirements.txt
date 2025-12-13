@@ -1,0 +1,7 @@
+# Beep Detection Server Requirements
+numpy>=1.24.0
+scipy>=1.10.0
+librosa>=0.10.0
+soundfile>=0.12.0
+flask>=2.3.0
+tensorflow>=2.13.0

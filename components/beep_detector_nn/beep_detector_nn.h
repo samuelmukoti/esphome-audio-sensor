@@ -9,6 +9,8 @@
 #include <vector>
 #include <cmath>
 
+// Simple built-in FFT - no external dependency needed
+
 namespace esphome {
 namespace beep_detector_nn {
 
@@ -125,6 +127,10 @@ class BeepDetectorNNComponent : public Component {
   // Timing
   uint32_t last_inference_time_{0};
   static const uint32_t INFERENCE_INTERVAL_MS = 250;
+
+  // FFT buffers (esp_dsp)
+  std::vector<float> fft_work_buffer_;  // 2*N_FFT for complex output
+  bool fft_initialized_{false};
 };
 
 }  // namespace beep_detector_nn
