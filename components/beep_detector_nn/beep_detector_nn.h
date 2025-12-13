@@ -101,8 +101,10 @@ class BeepDetectorNNComponent : public Component {
   uint8_t consecutive_detections_{0};
   bool last_detection_state_{false};
 
-  // Audio buffer
-  std::vector<int16_t> audio_buffer_;
+  // Audio buffer (ring buffer)
+  std::vector<int16_t> audio_buffer_;      // Ring buffer storage
+  std::vector<int16_t> audio_linear_;      // Linear copy for MFCC extraction
+  uint32_t audio_write_pos_{0};            // Ring buffer write position
   uint32_t window_samples_{0};
   float dc_offset_{0.0f};
 
