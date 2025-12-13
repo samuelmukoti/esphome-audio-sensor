@@ -10,7 +10,7 @@ external_components:
       type: git
       url: https://github.com/samuelmukoti/esphome-audio-sensor
       ref: main
-    components: [beep_detector, audio_streamer, beep_detector_nn]
+    components: [audio_streamer, beep_detector_nn]
     refresh: 0s
 
 esp32:
@@ -22,7 +22,7 @@ esp32:
 logger:
   level: DEBUG  # Set to INFO in production
   logs:
-    beep_detector: DEBUG
+    beep_detector_nn: DEBUG
     i2s_audio: DEBUG
 
 # Enable Home Assistant API
@@ -88,36 +88,6 @@ beep_detector_nn:
   detection_count:
     name: "Total Beep Detections (NN)"
 
-# Keep old Goertzel-based detector for comparison (disabled by default)
-beep_detector:
-  id: beep_detector_component
-  microphone: echo_microphone
-  target_frequency: 2615.0
-  sample_rate: 16000
-  window_size: 100
-  energy_threshold: 0.01
-  rms_threshold: 0.01
-  min_duration: 40
-  max_duration: 100
-  cooldown: 200
-  debounce_count: 2
-
-  binary_sensor:
-    name: "Beep Detected (Goertzel)"
-    device_class: sound
-    internal: true  # Hidden by default, enable for comparison
-
-  energy_sensor:
-    name: "Beep Energy Level"
-    internal: true
-
-  rms_sensor:
-    name: "Audio RMS Level"
-
-  detection_count:
-    name: "Total Beep Detections (Goertzel)"
-    internal: true
-
 # ============================================
 # Audio Streaming for Debugging
 # ============================================
@@ -148,17 +118,6 @@ switch:
       - lambda: 'id(beep_detector_nn_component).set_enabled(false);'
 
   - platform: template
-    name: "Goertzel Detection Enabled"
-    id: goertzel_detection_enabled
-    icon: "mdi:ear-hearing"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF  # Disabled by default, NN is primary
-    turn_on_action:
-      - lambda: 'id(beep_detector_component).set_enabled(true);'
-    turn_off_action:
-      - lambda: 'id(beep_detector_component).set_enabled(false);'
-
-  - platform: template
     name: "Audio Streaming"
     id: audio_streaming_enabled
     icon: "mdi:broadcast"
@@ -176,63 +135,8 @@ button:
     on_press:
       - lambda: 'id(beep_detector_nn_component).reset_detection_count();'
 
-  - platform: template
-    name: "Reset Goertzel Detection Count"
-    icon: "mdi:counter"
-    on_press:
-      - lambda: 'id(beep_detector_component).reset_detection_count();'
-
   - platform: restart
     name: "Restart Device"
-
-number:
-  # Energy Threshold - Primary detection sensitivity
-  - platform: template
-    name: "Energy Threshold"
-    id: energy_threshold_slider
-    icon: "mdi:tune-vertical"
-    unit_of_measurement: ""
-    mode: slider
-    min_value: 0.0001
-    max_value: 10.0
-    step: 0.001
-    initial_value: 0.01
-    optimistic: true
-    restore_value: true
-    set_action:
-      - lambda: 'id(beep_detector_component).set_energy_threshold_runtime(x);'
-
-  # RMS Threshold - Amplitude gate
-  - platform: template
-    name: "RMS Threshold"
-    id: rms_threshold_slider
-    icon: "mdi:volume-high"
-    unit_of_measurement: ""
-    mode: slider
-    min_value: 0.001
-    max_value: 0.5
-    step: 0.001
-    initial_value: 0.01
-    optimistic: true
-    restore_value: true
-    set_action:
-      - lambda: 'id(beep_detector_component).set_rms_threshold_runtime(x);'
-
-  # Target Frequency - For detecting different beep tones
-  - platform: template
-    name: "Target Frequency"
-    id: target_frequency_slider
-    icon: "mdi:sine-wave"
-    unit_of_measurement: "Hz"
-    mode: slider
-    min_value: 500
-    max_value: 5000
-    step: 10
-    initial_value: 2615
-    optimistic: true
-    restore_value: true
-    set_action:
-      - lambda: 'id(beep_detector_component).set_target_frequency_runtime(x);'
 
 # Device diagnostics
 sensor:
