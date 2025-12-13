@@ -62,7 +62,7 @@ beep_detector_nn:
 
   # Detection Parameters
   sample_rate: 16000          # Hz - must match microphone
-  window_size_ms: 500         # ms - analysis window (matches training)
+  window_size_ms: 250         # ms - analysis window (optimized for ESP32 memory)
   confidence_threshold: 0.7   # NN confidence threshold (0.0-1.0)
   debounce_count: 2           # consecutive detections required
 

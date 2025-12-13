@@ -12,7 +12,11 @@ namespace beep_detector_nn {
 static const char *TAG = "beep_detector_nn";
 
 void BeepDetectorNNComponent::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up Neural Network Beep Detector...");
+  ESP_LOGCONFIG(TAG, "Setting up Neural Network Beep Detector (v2 - memory optimized)...");
+
+#ifdef ESP32
+  ESP_LOGD(TAG, "  Free heap before allocation: %d bytes", ESP.getFreeHeap());
+#endif
 
   // Calculate window size in samples
   this->window_samples_ = this->sample_rate_ * this->window_size_ms_ / 1000;
@@ -20,27 +24,36 @@ void BeepDetectorNNComponent::setup() {
   ESP_LOGCONFIG(TAG, "  Window size: %d ms (%d samples)", this->window_size_ms_, this->window_samples_);
   ESP_LOGCONFIG(TAG, "  Confidence threshold: %.2f", this->confidence_threshold_);
   ESP_LOGCONFIG(TAG, "  Debounce count: %d", this->debounce_count_);
+  ESP_LOGCONFIG(TAG, "  Model: 2-layer CNN (8-8 filters), %d frames", MODEL_INPUT_FRAMES);
 
-  // Reserve buffer space
-  this->audio_buffer_.reserve(this->window_samples_ * 2);
+  // Pre-allocate audio buffer immediately (not lazy reserve!)
+  // This ensures we get the memory upfront rather than failing during callback
+  this->audio_buffer_.resize(this->window_samples_, 0);
+  ESP_LOGD(TAG, "  Audio buffer: %d bytes", this->window_samples_ * 2);
 
-  // Initialize MFCC buffer (50 frames x 20 features)
+  // Initialize MFCC buffer (25 frames x 20 features = 500 floats = 2KB)
   this->mfcc_buffer_.resize(MODEL_INPUT_FRAMES * MODEL_INPUT_FEATURES, 0.0f);
+  ESP_LOGD(TAG, "  MFCC buffer: %d bytes", MODEL_INPUT_FRAMES * MODEL_INPUT_FEATURES * 4);
 
-  // Initialize intermediate layer buffers
-  // After conv1: 50 x 8, after pool: 25 x 8
-  // After conv2: 25 x 16, after pool: 12 x 16
-  // After conv3: 12 x 32, after GAP: 32
-  this->layer_buffer_1_.resize(50 * 32, 0.0f);  // Largest needed
-  this->layer_buffer_2_.resize(50 * 32, 0.0f);
+  // Initialize intermediate layer buffers (much smaller for 2-layer model)
+  // After conv1: 25 x 8, after pool: 12 x 8
+  // After conv2: 12 x 8, after GAP: 8
+  // Max needed: 25 * 8 = 200 floats = 800 bytes each
+  this->layer_buffer_1_.resize(MODEL_INPUT_FRAMES * CONV1_FILTERS, 0.0f);
+  this->layer_buffer_2_.resize(MODEL_INPUT_FRAMES * CONV2_FILTERS, 0.0f);
+  ESP_LOGD(TAG, "  Layer buffers: %d bytes each", MODEL_INPUT_FRAMES * CONV1_FILTERS * 4);
 
-  // Pre-allocate MFCC computation buffers (avoid stack overflow)
+  // Pre-allocate MFCC computation buffers
   this->fft_frame_.resize(N_FFT, 0.0f);
-  this->fft_magnitude_.resize(N_FFT / 2 + 1, 0.0f);
+  this->fft_magnitude_.resize(N_FFT_BINS, 0.0f);
   this->mel_energies_.resize(N_MELS, 0.0f);
 
-  // Initialize mel filterbank
+  // Initialize mel filterbank (flat array instead of nested vectors)
   this->initialize_mel_filterbank();
+
+#ifdef ESP32
+  ESP_LOGD(TAG, "  Free heap after allocation: %d bytes", ESP.getFreeHeap());
+#endif
 
   // Register audio callback with microphone
   if (this->microphone_ != nullptr) {
@@ -58,7 +71,7 @@ void BeepDetectorNNComponent::setup() {
 
   this->initialized_ = true;
   this->last_inference_time_ = millis();
-  ESP_LOGI(TAG, "Neural Network Beep Detector initialized");
+  ESP_LOGI(TAG, "Neural Network Beep Detector initialized successfully");
 }
 
 void BeepDetectorNNComponent::loop() {
@@ -121,17 +134,13 @@ void BeepDetectorNNComponent::loop() {
     this->last_detection_state_ = confirmed;
     this->last_inference_time_ = now;
 
-    // Trim audio buffer to prevent memory growth
-    if (this->audio_buffer_.size() > this->window_samples_ * 2) {
-      this->audio_buffer_.erase(
-          this->audio_buffer_.begin(),
-          this->audio_buffer_.begin() + this->audio_buffer_.size() - this->window_samples_);
-    }
+    // No need to trim buffer - using fixed-size circular buffer now
   }
 }
 
 void BeepDetectorNNComponent::process_audio(const std::vector<uint8_t> &data) {
   // Convert uint8_t bytes to int16_t samples with DC offset removal
+  // Using circular buffer approach with pre-allocated memory
   for (size_t i = 0; i + 1 < data.size(); i += 2) {
     int16_t raw_sample = (int16_t)((data[i + 1] << 8) | data[i]);
 
@@ -140,7 +149,19 @@ void BeepDetectorNNComponent::process_audio(const std::vector<uint8_t> &data) {
 
     // Remove DC offset
     int16_t sample = raw_sample - (int16_t)this->dc_offset_;
-    this->audio_buffer_.push_back(sample);
+
+    // Shift buffer left and add new sample at end (circular buffer behavior)
+    // This avoids push_back which could cause reallocation
+    if (this->audio_buffer_.size() >= this->window_samples_) {
+      // Shift left by 1
+      std::memmove(this->audio_buffer_.data(),
+                   this->audio_buffer_.data() + 1,
+                   (this->window_samples_ - 1) * sizeof(int16_t));
+      this->audio_buffer_[this->window_samples_ - 1] = sample;
+    } else {
+      // Still filling initial buffer
+      this->audio_buffer_.push_back(sample);
+    }
   }
 }
 
@@ -181,11 +202,12 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
       App.feed_wdt();
     }
 
-    // Apply mel filterbank
+    // Apply mel filterbank (using flat array layout)
     for (int m = 0; m < N_MELS; m++) {
       mel_energies[m] = 0.0f;
-      for (size_t k = 0; k < this->mel_filterbank_[m].size(); k++) {
-        mel_energies[m] += this->mel_filterbank_[m][k] * magnitude[k];
+      int filter_offset = m * N_FFT_BINS;
+      for (int k = 0; k < N_FFT_BINS; k++) {
+        mel_energies[m] += this->mel_filterbank_[filter_offset + k] * magnitude[k];
       }
       // Log compression
       mel_energies[m] = logf(mel_energies[m] + 1e-10f);
@@ -222,43 +244,45 @@ void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, fl
 }
 
 void BeepDetectorNNComponent::initialize_mel_filterbank() {
-  // Create mel filterbank
-  this->mel_filterbank_.resize(N_MELS);
+  // Create mel filterbank as flat array to minimize heap fragmentation
+  // Layout: mel_filterbank_[filter_idx * N_FFT_BINS + bin_idx]
+  this->mel_filterbank_.resize(N_MELS * N_FFT_BINS, 0.0f);
 
   float mel_min = this->hz_to_mel(0.0f);
   float mel_max = this->hz_to_mel(this->sample_rate_ / 2.0f);
 
-  // Mel points
-  std::vector<float> mel_points(N_MELS + 2);
+  // Use stack arrays for temporary mel/bin points (small enough)
+  float mel_points[N_MELS + 2];
+  int bin_points[N_MELS + 2];
+
   for (int i = 0; i < N_MELS + 2; i++) {
     mel_points[i] = mel_min + i * (mel_max - mel_min) / (N_MELS + 1);
-  }
-
-  // Convert to Hz and then to FFT bins
-  std::vector<int> bin_points(N_MELS + 2);
-  for (int i = 0; i < N_MELS + 2; i++) {
     float hz = this->mel_to_hz(mel_points[i]);
     bin_points[i] = (int)floorf((N_FFT + 1) * hz / this->sample_rate_);
   }
 
-  // Create triangular filters
-  int num_bins = N_FFT / 2 + 1;
+  // Create triangular filters in flat array
   for (int m = 0; m < N_MELS; m++) {
-    this->mel_filterbank_[m].resize(num_bins, 0.0f);
+    int filter_offset = m * N_FFT_BINS;
 
+    // Rising edge
     for (int k = bin_points[m]; k < bin_points[m + 1]; k++) {
-      if (k < num_bins) {
-        this->mel_filterbank_[m][k] = (float)(k - bin_points[m]) / (bin_points[m + 1] - bin_points[m]);
+      if (k < N_FFT_BINS && bin_points[m + 1] != bin_points[m]) {
+        this->mel_filterbank_[filter_offset + k] =
+            (float)(k - bin_points[m]) / (bin_points[m + 1] - bin_points[m]);
       }
     }
+    // Falling edge
     for (int k = bin_points[m + 1]; k < bin_points[m + 2]; k++) {
-      if (k < num_bins) {
-        this->mel_filterbank_[m][k] = (float)(bin_points[m + 2] - k) / (bin_points[m + 2] - bin_points[m + 1]);
+      if (k < N_FFT_BINS && bin_points[m + 2] != bin_points[m + 1]) {
+        this->mel_filterbank_[filter_offset + k] =
+            (float)(bin_points[m + 2] - k) / (bin_points[m + 2] - bin_points[m + 1]);
       }
     }
   }
 
-  ESP_LOGD(TAG, "Mel filterbank initialized with %d filters", N_MELS);
+  ESP_LOGD(TAG, "Mel filterbank initialized: %d filters x %d bins = %d bytes",
+           N_MELS, N_FFT_BINS, N_MELS * N_FFT_BINS * 4);
 }
 
 float BeepDetectorNNComponent::hz_to_mel(float hz) {
@@ -270,54 +294,41 @@ float BeepDetectorNNComponent::mel_to_hz(float mel) {
 }
 
 float BeepDetectorNNComponent::run_inference(const float *mfcc_input) {
-  // Manual neural network forward pass
+  // Manual neural network forward pass (v2 - simplified 2-layer model)
   // Architecture: Conv1D(8) -> BN -> ReLU -> Pool ->
-  //               Conv1D(16) -> BN -> ReLU -> Pool ->
-  //               Conv1D(32) -> BN -> ReLU -> GAP ->
-  //               Dense(16) -> ReLU -> Dense(8) -> ReLU -> Dense(1) -> Sigmoid
+  //               Conv1D(8) -> BN -> ReLU -> GAP ->
+  //               Dense(8) -> ReLU -> Dense(1) -> Sigmoid
 
   float *buf1 = this->layer_buffer_1_.data();
   float *buf2 = this->layer_buffer_2_.data();
 
   // Layer 1: Conv1D(8) + BatchNorm + ReLU
-  // Input: (50, 20), Output: (50, 8)
-  this->conv1d_bn_relu(mfcc_input, buf1, 50, 20, 8,
+  // Input: (25, 20), Output: (25, 8)
+  this->conv1d_bn_relu(mfcc_input, buf1, MODEL_INPUT_FRAMES, 20, CONV1_FILTERS,
                        conv1d_kernel, conv1d_bias,
-                       batchnormalization_gamma, batchnormalization_beta,
-                       batchnormalization_mean, batchnormalization_var);
+                       batch_normalization_gamma, batch_normalization_beta,
+                       batch_normalization_mean, batch_normalization_var);
 
-  // MaxPool1D: (50, 8) -> (25, 8)
-  this->maxpool1d(buf1, buf2, 50, 8);
+  // MaxPool1D: (25, 8) -> (12, 8)
+  this->maxpool1d(buf1, buf2, MODEL_INPUT_FRAMES, CONV1_FILTERS);
 
-  // Layer 2: Conv1D(16) + BatchNorm + ReLU
-  // Input: (25, 8), Output: (25, 16)
-  this->conv1d_bn_relu(buf2, buf1, 25, 8, 16,
-                       conv1d1_kernel, conv1d1_bias,
-                       batchnormalization1_gamma, batchnormalization1_beta,
-                       batchnormalization1_mean, batchnormalization1_var);
+  // Layer 2: Conv1D(8) + BatchNorm + ReLU
+  // Input: (12, 8), Output: (12, 8)
+  int pool1_len = MODEL_INPUT_FRAMES / 2;  // 12
+  this->conv1d_bn_relu(buf2, buf1, pool1_len, CONV1_FILTERS, CONV2_FILTERS,
+                       conv1d_1_kernel, conv1d_1_bias,
+                       batch_normalization_1_gamma, batch_normalization_1_beta,
+                       batch_normalization_1_mean, batch_normalization_1_var);
 
-  // MaxPool1D: (25, 16) -> (12, 16)
-  this->maxpool1d(buf1, buf2, 25, 16);
-
-  // Layer 3: Conv1D(32) + BatchNorm + ReLU
-  // Input: (12, 16), Output: (12, 32)
-  this->conv1d_bn_relu(buf2, buf1, 12, 16, 32,
-                       conv1d2_kernel, conv1d2_bias,
-                       batchnormalization2_gamma, batchnormalization2_beta,
-                       batchnormalization2_mean, batchnormalization2_var);
-
-  // GlobalAveragePooling1D: (12, 32) -> (32,)
-  this->global_avg_pool1d(buf1, buf2, 12, 32);
-
-  // Dense(16) + ReLU
-  this->dense_relu(buf2, buf1, 32, 16, dense_kernel, dense_bias);
+  // GlobalAveragePooling1D: (12, 8) -> (8,)
+  this->global_avg_pool1d(buf1, buf2, pool1_len, CONV2_FILTERS);
 
   // Dense(8) + ReLU (skip dropout at inference)
-  this->dense_relu(buf1, buf2, 16, 8, dense1_kernel, dense1_bias);
+  this->dense_relu(buf2, buf1, DENSE_UNITS, DENSE_UNITS, dense_kernel, dense_bias);
 
   // Dense(1) + Sigmoid
   float output;
-  this->dense_sigmoid(buf2, &output, 8, 1, dense2_kernel, dense2_bias);
+  this->dense_sigmoid(buf1, &output, DENSE_UNITS, 1, dense_1_kernel, dense_1_bias);
 
   return output;
 }

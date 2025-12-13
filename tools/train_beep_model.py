@@ -26,44 +26,37 @@ def build_model(input_shape: tuple[int, int]) -> keras.Model:
     """
     Build a TinyML-compatible CNN for beep detection.
 
-    Architecture designed to be small enough for ESP32:
-    - Conv1D layers (more efficient than Conv2D for sequences)
-    - GlobalAveragePooling (reduces parameters vs Flatten)
-    - Small dense layers
+    Memory-optimized architecture for ESP32 (original, not S3):
+    - Only 2 Conv1D layers (reduced from 3)
+    - Small filter counts (8 channels max)
+    - GlobalAveragePooling for minimal parameters
+    - Single dense layer before output
 
-    Input shape: (n_frames, n_mfcc) e.g., (49, 20)
+    Input shape: (n_frames, n_mfcc) e.g., (25, 20) for 250ms window
+    Target memory: <25KB total heap usage
     """
     model = keras.Sequential([
         # Input layer
         layers.Input(shape=input_shape),
 
-        # First conv block
+        # First conv block: 8 filters
         layers.Conv1D(8, kernel_size=3, padding='same'),
         layers.BatchNormalization(),
         layers.ReLU(),
         layers.MaxPooling1D(pool_size=2),
 
-        # Second conv block
-        layers.Conv1D(16, kernel_size=3, padding='same'),
-        layers.BatchNormalization(),
-        layers.ReLU(),
-        layers.MaxPooling1D(pool_size=2),
-
-        # Third conv block (optional, can remove if model too large)
-        layers.Conv1D(32, kernel_size=3, padding='same'),
+        # Second conv block: 8 filters (keep small for memory)
+        layers.Conv1D(8, kernel_size=3, padding='same'),
         layers.BatchNormalization(),
         layers.ReLU(),
 
         # Global pooling (much more efficient than Flatten)
         layers.GlobalAveragePooling1D(),
 
-        # Dense layers
-        layers.Dense(16),
-        layers.ReLU(),
-        layers.Dropout(0.3),
-
+        # Single dense layer (reduced from 2)
         layers.Dense(8),
         layers.ReLU(),
+        layers.Dropout(0.3),
 
         # Output
         layers.Dense(1, activation='sigmoid')

@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 
 # Constants matching ESP32 target
 TARGET_SAMPLE_RATE = 16000
-WINDOW_DURATION_MS = 500  # 500ms windows for classification
+WINDOW_DURATION_MS = 250  # 250ms windows for classification (reduced for ESP32 memory)
 HOP_DURATION_MS = 10  # 10ms hop for MFCC
 N_MFCC = 20  # Number of MFCC coefficients
 

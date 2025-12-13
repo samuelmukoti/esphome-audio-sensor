@@ -12,15 +12,21 @@
 namespace esphome {
 namespace beep_detector_nn {
 
-// MFCC extraction parameters
+// MFCC extraction parameters (memory-optimized for ESP32)
 static const int N_MFCC = 20;
-static const int N_FFT = 512;
-static const int HOP_LENGTH = 160;  // 10ms at 16kHz
-static const int N_MELS = 40;
+static const int N_FFT = 256;        // Reduced from 512 to save memory
+static const int HOP_LENGTH = 160;   // 10ms at 16kHz
+static const int N_MELS = 26;        // Reduced from 40 to save memory
+static const int N_FFT_BINS = N_FFT / 2 + 1;  // 129 bins
 
-// Model input shape
-static const int MODEL_INPUT_FRAMES = 50;
+// Model input shape (250ms window = 25 frames)
+static const int MODEL_INPUT_FRAMES = 25;  // Reduced from 50 (250ms vs 500ms)
 static const int MODEL_INPUT_FEATURES = 20;
+
+// Model architecture: 2 conv layers (8 filters each) + 1 dense layer
+static const int CONV1_FILTERS = 8;
+static const int CONV2_FILTERS = 8;
+static const int DENSE_UNITS = 8;
 
 class BeepDetectorNNComponent : public Component {
  public:
@@ -85,7 +91,7 @@ class BeepDetectorNNComponent : public Component {
   // Configuration
   uint32_t sample_rate_{16000};
   float confidence_threshold_{0.7f};
-  uint32_t window_size_ms_{500};
+  uint32_t window_size_ms_{250};  // Reduced from 500ms for memory efficiency
   uint8_t debounce_count_{2};
 
   // State
@@ -100,8 +106,9 @@ class BeepDetectorNNComponent : public Component {
   uint32_t window_samples_{0};
   float dc_offset_{0.0f};
 
-  // Mel filterbank (pre-computed)
-  std::vector<std::vector<float>> mel_filterbank_;
+  // Mel filterbank (pre-computed as flat array to avoid heap fragmentation)
+  // Layout: mel_filterbank_[filter_idx * N_FFT_BINS + bin_idx]
+  std::vector<float> mel_filterbank_;
 
   // Intermediate buffers for inference
   std::vector<float> mfcc_buffer_;
