@@ -219,10 +219,9 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
     // Compute magnitude spectrum (simplified DFT)
     this->compute_magnitude_spectrum(frame, magnitude, frame_length);
 
-    // Feed watchdog every 10 frames to prevent timeout
-    if (f % 10 == 0) {
-      App.feed_wdt();
-    }
+    // Feed watchdog and yield every frame to allow API/WiFi tasks
+    App.feed_wdt();
+    delay(1);  // Yield to other tasks
 
     // Apply mel filterbank (using flat array layout)
     for (int m = 0; m < N_MELS; m++) {
@@ -263,9 +262,10 @@ void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, fl
     }
     magnitude[k] = sqrtf(real * real + imag * imag);
 
-    // Feed watchdog every 16 bins to prevent timeout (critical for ESP32)
-    if ((k & 0x0F) == 0) {
+    // Feed watchdog and yield every 8 bins to allow API/WiFi tasks to run
+    if ((k & 0x07) == 0) {
       App.feed_wdt();
+      delay(1);  // Yield to other tasks (WiFi, API)
     }
   }
 }

@@ -102,7 +102,7 @@ switch:
     id: nn_detection_enabled
     icon: "mdi:brain"
     optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: RESTORE_DEFAULT_OFF  # Start disabled - inference takes 16s and blocks API
     turn_on_action:
       - lambda: "id(beep_detector_nn_component).set_enabled(true);"
     turn_off_action:
