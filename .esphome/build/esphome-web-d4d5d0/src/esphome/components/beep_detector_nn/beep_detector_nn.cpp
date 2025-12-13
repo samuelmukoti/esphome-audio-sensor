@@ -26,10 +26,12 @@ void BeepDetectorNNComponent::setup() {
   ESP_LOGCONFIG(TAG, "  Debounce count: %d", this->debounce_count_);
   ESP_LOGCONFIG(TAG, "  Model: 2-layer CNN (8-8 filters), %d frames", MODEL_INPUT_FRAMES);
 
-  // Pre-allocate audio buffer immediately (not lazy reserve!)
+  // Pre-allocate audio buffers immediately (not lazy reserve!)
   // This ensures we get the memory upfront rather than failing during callback
-  this->audio_buffer_.resize(this->window_samples_, 0);
-  ESP_LOGD(TAG, "  Audio buffer: %d bytes", this->window_samples_ * 2);
+  this->audio_buffer_.resize(this->window_samples_, 0);  // Ring buffer
+  this->audio_linear_.resize(this->window_samples_, 0);  // Linear copy for MFCC
+  this->audio_write_pos_ = 0;
+  ESP_LOGD(TAG, "  Audio buffers: %d bytes (ring + linear)", this->window_samples_ * 4);
 
   // Initialize MFCC buffer (25 frames x 20 features = 500 floats = 2KB)
   this->mfcc_buffer_.resize(MODEL_INPUT_FRAMES * MODEL_INPUT_FEATURES, 0.0f);
@@ -83,15 +85,43 @@ void BeepDetectorNNComponent::loop() {
 
   // Run inference at regular intervals when we have enough data
   if (now - this->last_inference_time_ >= INFERENCE_INTERVAL_MS &&
-      this->audio_buffer_.size() >= this->window_samples_) {
+      this->audio_write_pos_ >= this->window_samples_) {
 
-    // Extract MFCC features from the audio buffer
-    this->extract_mfcc(this->audio_buffer_.data(),
-                       std::min((int)this->audio_buffer_.size(), (int)this->window_samples_),
+    // Feed watchdog before heavy computation
+    App.feed_wdt();
+
+    // Copy ring buffer to linear buffer in correct temporal order
+    // The ring buffer wraps around, so we need to unwrap it:
+    // - Oldest sample is at (audio_write_pos_ % window_samples_)
+    // - Copy from that position to end, then from 0 to that position
+    uint32_t start_pos = this->audio_write_pos_ % this->window_samples_;
+    uint32_t first_chunk = this->window_samples_ - start_pos;
+
+    // Copy from start_pos to end of buffer
+    std::memcpy(this->audio_linear_.data(),
+                this->audio_buffer_.data() + start_pos,
+                first_chunk * sizeof(int16_t));
+
+    // Copy from beginning to start_pos (if any)
+    if (start_pos > 0) {
+      std::memcpy(this->audio_linear_.data() + first_chunk,
+                  this->audio_buffer_.data(),
+                  start_pos * sizeof(int16_t));
+    }
+
+    // Extract MFCC features from the linearized audio buffer
+    this->extract_mfcc(this->audio_linear_.data(),
+                       this->window_samples_,
                        this->mfcc_buffer_.data());
+
+    // Feed watchdog between MFCC and inference
+    App.feed_wdt();
 
     // Run neural network inference
     float confidence = this->run_inference(this->mfcc_buffer_.data());
+
+    // Feed watchdog after inference
+    App.feed_wdt();
 
     // Update confidence sensor
     if (this->confidence_sensor_ != nullptr) {
@@ -140,7 +170,8 @@ void BeepDetectorNNComponent::loop() {
 
 void BeepDetectorNNComponent::process_audio(const std::vector<uint8_t> &data) {
   // Convert uint8_t bytes to int16_t samples with DC offset removal
-  // Using circular buffer approach with pre-allocated memory
+  // Using TRUE ring buffer - just write at position and increment
+  // No memmove! This is O(1) per sample instead of O(n)
   for (size_t i = 0; i + 1 < data.size(); i += 2) {
     int16_t raw_sample = (int16_t)((data[i + 1] << 8) | data[i]);
 
@@ -150,18 +181,9 @@ void BeepDetectorNNComponent::process_audio(const std::vector<uint8_t> &data) {
     // Remove DC offset
     int16_t sample = raw_sample - (int16_t)this->dc_offset_;
 
-    // Shift buffer left and add new sample at end (circular buffer behavior)
-    // This avoids push_back which could cause reallocation
-    if (this->audio_buffer_.size() >= this->window_samples_) {
-      // Shift left by 1
-      std::memmove(this->audio_buffer_.data(),
-                   this->audio_buffer_.data() + 1,
-                   (this->window_samples_ - 1) * sizeof(int16_t));
-      this->audio_buffer_[this->window_samples_ - 1] = sample;
-    } else {
-      // Still filling initial buffer
-      this->audio_buffer_.push_back(sample);
-    }
+    // Write directly to ring buffer position - O(1) operation!
+    this->audio_buffer_[this->audio_write_pos_ % this->window_samples_] = sample;
+    this->audio_write_pos_++;
   }
 }
 
@@ -226,7 +248,7 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
 
 void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, float *magnitude, int n) {
   // Simplified DFT - only compute bins we need for mel filterbank
-  // This reduces computation significantly
+  // This is O(N²) but simpler than FFT
   int half_n = n / 2 + 1;
 
   for (int k = 0; k < half_n; k++) {
@@ -240,6 +262,11 @@ void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, fl
       angle += angle_step;
     }
     magnitude[k] = sqrtf(real * real + imag * imag);
+
+    // Feed watchdog every 16 bins to prevent timeout (critical for ESP32)
+    if ((k & 0x0F) == 0) {
+      App.feed_wdt();
+    }
   }
 }
 
@@ -364,6 +391,11 @@ void BeepDetectorNNComponent::conv1d_bn_relu(
 
       // ReLU
       output[t * out_ch + oc] = bn_out > 0.0f ? bn_out : 0.0f;
+    }
+
+    // Feed watchdog every 8 time steps
+    if ((t & 0x07) == 0) {
+      App.feed_wdt();
     }
   }
 }

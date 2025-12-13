@@ -97,8 +97,8 @@ void setup() {
   //   passive_scan: false
   //   enable_on_boot: true
   //   networks:
-  //     - ssid: !secret 'wifi_ssid'
-  //       password: !secret 'wifi_password'
+  //     - ssid: Goshen
+  //       password: '@WeRHere'
   //       id: wifi_wifiap_id
   //       priority: 0.0
   //   use_address: esphome-web-d4d5d0.local
@@ -106,8 +106,8 @@ void setup() {
   wifi_wificomponent_id->set_use_address("esphome-web-d4d5d0.local");
   {
   wifi::WiFiAP wifi_wifiap_id = wifi::WiFiAP();
-  wifi_wifiap_id.set_ssid("YourWiFiSSID");
-  wifi_wifiap_id.set_password("YourWiFiPassword");
+  wifi_wifiap_id.set_ssid("Goshen");
+  wifi_wifiap_id.set_password("@WeRHere");
   wifi_wifiap_id.set_priority(0.0f);
   wifi_wificomponent_id->add_sta(wifi_wifiap_id);
   }
@@ -360,13 +360,13 @@ void setup() {
   App.register_component(nn_detection_enabled);
   automation_id_3 = new Automation<>(nn_detection_enabled->get_turn_off_trigger());
   lambdaaction_id_2 = new LambdaAction<>([=]() -> void {
-      #line 105 "esphome-atom-d4d5d0.yaml"
+      #line 109 "esphome-atom-d4d5d0.yaml"
       beep_detector_nn_component->set_enabled(false);
   });
   automation_id_3->add_actions({lambdaaction_id_2});
   automation_id_2 = new Automation<>(nn_detection_enabled->get_turn_on_trigger());
   lambdaaction_id = new LambdaAction<>([=]() -> void {
-      #line 103 "esphome-atom-d4d5d0.yaml"
+      #line 107 "esphome-atom-d4d5d0.yaml"
       beep_detector_nn_component->set_enabled(true);
   });
   automation_id_2->add_actions({lambdaaction_id});
@@ -394,7 +394,7 @@ void setup() {
   button_buttonpresstrigger_id = new button::ButtonPressTrigger(template__templatebutton_id);
   automation_id_4 = new Automation<>(button_buttonpresstrigger_id);
   lambdaaction_id_3 = new LambdaAction<>([=]() -> void {
-      #line 112 "esphome-atom-d4d5d0.yaml"
+      #line 116 "esphome-atom-d4d5d0.yaml"
       beep_detector_nn_component->reset_detection_count();
   });
   automation_id_4->add_actions({lambdaaction_id_3});
