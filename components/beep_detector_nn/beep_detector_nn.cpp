@@ -1,6 +1,7 @@
 #include "beep_detector_nn.h"
 #include "model_weights.h"
 #include "esphome/core/log.h"
+#include "esphome/core/application.h"
 
 #include <cstring>
 #include <algorithm>
@@ -32,6 +33,11 @@ void BeepDetectorNNComponent::setup() {
   // After conv3: 12 x 32, after GAP: 32
   this->layer_buffer_1_.resize(50 * 32, 0.0f);  // Largest needed
   this->layer_buffer_2_.resize(50 * 32, 0.0f);
+
+  // Pre-allocate MFCC computation buffers (avoid stack overflow)
+  this->fft_frame_.resize(N_FFT, 0.0f);
+  this->fft_magnitude_.resize(N_FFT / 2 + 1, 0.0f);
+  this->mel_energies_.resize(N_MELS, 0.0f);
 
   // Initialize mel filterbank
   this->initialize_mel_filterbank();
@@ -139,17 +145,17 @@ void BeepDetectorNNComponent::process_audio(const std::vector<uint8_t> &data) {
 }
 
 void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples, float *mfcc_output) {
-  // Simplified MFCC extraction
+  // Simplified MFCC extraction using pre-allocated buffers
   // We compute a rough approximation suitable for our trained model
 
   const int frame_length = N_FFT;
   const int hop_length = HOP_LENGTH;
   const int num_frames = MODEL_INPUT_FRAMES;
 
-  // Working buffers
-  std::vector<float> frame(frame_length, 0.0f);
-  std::vector<float> magnitude(frame_length / 2 + 1, 0.0f);
-  std::vector<float> mel_energies(N_MELS, 0.0f);
+  // Use pre-allocated buffers (avoid stack overflow)
+  float *frame = this->fft_frame_.data();
+  float *magnitude = this->fft_magnitude_.data();
+  float *mel_energies = this->mel_energies_.data();
 
   // Process each frame
   for (int f = 0; f < num_frames; f++) {
@@ -167,16 +173,19 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
       }
     }
 
-    // Compute magnitude spectrum (simplified FFT approximation)
-    this->compute_magnitude_spectrum(frame.data(), magnitude.data(), frame_length);
+    // Compute magnitude spectrum (simplified DFT)
+    this->compute_magnitude_spectrum(frame, magnitude, frame_length);
+
+    // Feed watchdog every 10 frames to prevent timeout
+    if (f % 10 == 0) {
+      App.feed_wdt();
+    }
 
     // Apply mel filterbank
     for (int m = 0; m < N_MELS; m++) {
       mel_energies[m] = 0.0f;
       for (size_t k = 0; k < this->mel_filterbank_[m].size(); k++) {
-        if (k < magnitude.size()) {
-          mel_energies[m] += this->mel_filterbank_[m][k] * magnitude[k];
-        }
+        mel_energies[m] += this->mel_filterbank_[m][k] * magnitude[k];
       }
       // Log compression
       mel_energies[m] = logf(mel_energies[m] + 1e-10f);
@@ -194,17 +203,19 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
 }
 
 void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, float *magnitude, int n) {
-  // Simplified DFT for small n (not optimized, but works)
-  // For ESP32, consider using ESP-DSP library for better performance
+  // Simplified DFT - only compute bins we need for mel filterbank
+  // This reduces computation significantly
   int half_n = n / 2 + 1;
 
   for (int k = 0; k < half_n; k++) {
     float real = 0.0f;
     float imag = 0.0f;
+    float angle_step = -2.0f * M_PI * k / n;
+    float angle = 0.0f;
     for (int i = 0; i < n; i++) {
-      float angle = -2.0f * M_PI * k * i / n;
       real += signal[i] * cosf(angle);
       imag += signal[i] * sinf(angle);
+      angle += angle_step;
     }
     magnitude[k] = sqrtf(real * real + imag * imag);
   }

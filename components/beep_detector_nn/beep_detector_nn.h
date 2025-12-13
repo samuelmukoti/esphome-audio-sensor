@@ -108,6 +108,11 @@ class BeepDetectorNNComponent : public Component {
   std::vector<float> layer_buffer_1_;
   std::vector<float> layer_buffer_2_;
 
+  // Pre-allocated MFCC computation buffers (avoid stack allocation)
+  std::vector<float> fft_frame_;
+  std::vector<float> fft_magnitude_;
+  std::vector<float> mel_energies_;
+
   // Timing
   uint32_t last_inference_time_{0};
   static const uint32_t INFERENCE_INTERVAL_MS = 250;
