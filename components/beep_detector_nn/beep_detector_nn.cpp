@@ -85,13 +85,22 @@ void BeepDetectorNNComponent::loop() {
   if (now - this->last_inference_time_ >= INFERENCE_INTERVAL_MS &&
       this->audio_buffer_.size() >= this->window_samples_) {
 
+    // Feed watchdog before heavy computation
+    App.feed_wdt();
+
     // Extract MFCC features from the audio buffer
     this->extract_mfcc(this->audio_buffer_.data(),
                        std::min((int)this->audio_buffer_.size(), (int)this->window_samples_),
                        this->mfcc_buffer_.data());
 
+    // Feed watchdog between MFCC and inference
+    App.feed_wdt();
+
     // Run neural network inference
     float confidence = this->run_inference(this->mfcc_buffer_.data());
+
+    // Feed watchdog after inference
+    App.feed_wdt();
 
     // Update confidence sensor
     if (this->confidence_sensor_ != nullptr) {
@@ -226,7 +235,7 @@ void BeepDetectorNNComponent::extract_mfcc(const int16_t *audio, int num_samples
 
 void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, float *magnitude, int n) {
   // Simplified DFT - only compute bins we need for mel filterbank
-  // This reduces computation significantly
+  // This is O(N²) but simpler than FFT
   int half_n = n / 2 + 1;
 
   for (int k = 0; k < half_n; k++) {
@@ -240,6 +249,11 @@ void BeepDetectorNNComponent::compute_magnitude_spectrum(const float *signal, fl
       angle += angle_step;
     }
     magnitude[k] = sqrtf(real * real + imag * imag);
+
+    // Feed watchdog every 16 bins to prevent timeout (critical for ESP32)
+    if ((k & 0x0F) == 0) {
+      App.feed_wdt();
+    }
   }
 }
 
@@ -364,6 +378,11 @@ void BeepDetectorNNComponent::conv1d_bn_relu(
 
       // ReLU
       output[t * out_ch + oc] = bn_out > 0.0f ? bn_out : 0.0f;
+    }
+
+    // Feed watchdog every 8 time steps
+    if ((t & 0x07) == 0) {
+      App.feed_wdt();
     }
   }
 }
