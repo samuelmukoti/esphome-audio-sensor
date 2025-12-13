@@ -10,7 +10,7 @@ external_components:
       type: git
       url: https://github.com/samuelmukoti/esphome-audio-sensor
       ref: main
-    components: [beep_detector, audio_streamer]
+    components: [beep_detector, audio_streamer, beep_detector_nn]
     refresh: 0s
 
 esp32:
@@ -54,45 +54,69 @@ microphone:
     channel: left
     # DC offset removal handled in beep_detector C++ code
 
-# Beep Detector Component
-beep_detector:
-  id: beep_detector_component
+# Neural Network Beep Detector Component
+# Uses trained CNN model for robust beep detection
+beep_detector_nn:
+  id: beep_detector_nn_component
   microphone: echo_microphone
 
-  # Detection Parameters (based on audio analysis)
-  target_frequency: 2615.0  # Hz - primary beep frequency
-  sample_rate: 16000         # Hz - must match microphone
-  window_size: 100           # ms - analysis window
-  energy_threshold: 0.01     # Goertzel energy threshold (lowered for testing)
-  rms_threshold: 0.01        # RMS amplitude threshold (raised above ambient ~0.04)
-  min_duration: 40           # ms - minimum beep duration
-  max_duration: 100          # ms - maximum beep duration
-  cooldown: 200              # ms - cooldown after detection
-  debounce_count: 2          # consecutive detections required
+  # Detection Parameters
+  sample_rate: 16000          # Hz - must match microphone
+  window_size_ms: 500         # ms - analysis window (matches training)
+  confidence_threshold: 0.7   # NN confidence threshold (0.0-1.0)
+  debounce_count: 2           # consecutive detections required
 
   # Binary sensor for beep detection state
   binary_sensor:
-    name: "Beep Detected"
+    name: "Beep Detected (NN)"
     device_class: sound
     filters:
       - delayed_off: 100ms  # Keep state ON briefly for visibility
     on_press:
-      # Fire HA event for automations (more reliable than state changes)
+      # Fire HA event for automations
       - homeassistant.event:
           event: esphome.beep_detected
           data:
             device: "m5stack_echo"
-            message: "Beep detected!"
+            message: "Beep detected by neural network!"
 
-  # Diagnostic sensors for tuning
+  # Confidence sensor (0.0 - 1.0)
+  confidence_sensor:
+    name: "Beep Confidence"
+
+  # Detection count
+  detection_count:
+    name: "Total Beep Detections (NN)"
+
+# Keep old Goertzel-based detector for comparison (disabled by default)
+beep_detector:
+  id: beep_detector_component
+  microphone: echo_microphone
+  target_frequency: 2615.0
+  sample_rate: 16000
+  window_size: 100
+  energy_threshold: 0.01
+  rms_threshold: 0.01
+  min_duration: 40
+  max_duration: 100
+  cooldown: 200
+  debounce_count: 2
+
+  binary_sensor:
+    name: "Beep Detected (Goertzel)"
+    device_class: sound
+    internal: true  # Hidden by default, enable for comparison
+
   energy_sensor:
     name: "Beep Energy Level"
+    internal: true
 
   rms_sensor:
     name: "Audio RMS Level"
 
   detection_count:
-    name: "Total Beep Detections"
+    name: "Total Beep Detections (Goertzel)"
+    internal: true
 
 # ============================================
 # Audio Streaming for Debugging
@@ -113,11 +137,22 @@ audio_streamer:
 
 switch:
   - platform: template
-    name: "Beep Detection Enabled"
-    id: beep_detection_enabled
-    icon: "mdi:ear-hearing"
+    name: "NN Beep Detection Enabled"
+    id: nn_detection_enabled
+    icon: "mdi:brain"
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: 'id(beep_detector_nn_component).set_enabled(true);'
+    turn_off_action:
+      - lambda: 'id(beep_detector_nn_component).set_enabled(false);'
+
+  - platform: template
+    name: "Goertzel Detection Enabled"
+    id: goertzel_detection_enabled
+    icon: "mdi:ear-hearing"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF  # Disabled by default, NN is primary
     turn_on_action:
       - lambda: 'id(beep_detector_component).set_enabled(true);'
     turn_off_action:
@@ -136,7 +171,13 @@ switch:
 
 button:
   - platform: template
-    name: "Reset Detection Count"
+    name: "Reset NN Detection Count"
+    icon: "mdi:counter"
+    on_press:
+      - lambda: 'id(beep_detector_nn_component).reset_detection_count();'
+
+  - platform: template
+    name: "Reset Goertzel Detection Count"
     icon: "mdi:counter"
     on_press:
       - lambda: 'id(beep_detector_component).reset_detection_count();'

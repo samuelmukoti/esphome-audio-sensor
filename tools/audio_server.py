@@ -4,15 +4,20 @@ Audio Streaming Server for ESPHome Beep Detector Debugging
 
 Receives UDP audio stream from ESP32 and provides:
 - Real-time audio analysis (RMS, Goertzel energy, FFT)
+- Neural network beep detection
 - WAV file recording
 - Detection event logging
 - MQTT integration for Home Assistant
 
 Usage:
-    python audio_server.py --port 5000 --sample-rate 16000 --target-freq 2615
+    # Live UDP stream with NN detection
+    python audio_server.py --port 5000 --use-nn
+
+    # Test on audio file
+    python audio_server.py --test-file ../water_heater_beeping_error_sound.m4a --use-nn
 
 Requirements:
-    pip install numpy scipy paho-mqtt
+    pip install numpy scipy paho-mqtt tensorflow librosa
 """
 
 import argparse
@@ -24,10 +29,196 @@ import os
 from datetime import datetime
 from collections import deque
 from typing import Optional
+from pathlib import Path
 
 import numpy as np
 
 from audio_analyzer import AudioAnalyzer
+
+
+class NeuralBeepDetector:
+    """Neural network-based beep detector using trained CNN model."""
+
+    def __init__(
+        self,
+        model_path: str = "models/beep_detector.keras",
+        sample_rate: int = 16000,
+        window_duration_ms: int = 500,
+        hop_duration_ms: int = 10,
+        n_mfcc: int = 20,
+        confidence_threshold: float = 0.5,
+    ):
+        self.sample_rate = sample_rate
+        self.window_duration_ms = window_duration_ms
+        self.hop_duration_ms = hop_duration_ms
+        self.n_mfcc = n_mfcc
+        self.confidence_threshold = confidence_threshold
+
+        # Calculate window size in samples
+        self.window_samples = int(sample_rate * window_duration_ms / 1000)
+        self.hop_samples = int(sample_rate * hop_duration_ms / 1000)
+
+        # Buffer for accumulating audio
+        self.audio_buffer = np.array([], dtype=np.int16)
+
+        # Load model
+        self.model = None
+        self._load_model(model_path)
+
+        # Detection state for debouncing
+        self.consecutive_detections = 0
+        self.debounce_count = 2
+
+        print(f"NeuralBeepDetector initialized:")
+        print(f"  Model: {model_path}")
+        print(f"  Window: {window_duration_ms}ms ({self.window_samples} samples)")
+        print(f"  Confidence threshold: {confidence_threshold}")
+
+    def _load_model(self, model_path: str):
+        """Load the trained Keras model."""
+        try:
+            import tensorflow as tf
+            # Suppress TF warnings
+            tf.get_logger().setLevel('ERROR')
+
+            if os.path.exists(model_path):
+                self.model = tf.keras.models.load_model(model_path)
+                print(f"  Model loaded successfully")
+            else:
+                print(f"  WARNING: Model not found at {model_path}")
+                print(f"  Run train_beep_model.py first!")
+        except Exception as e:
+            print(f"  ERROR loading model: {e}")
+            self.model = None
+
+    def extract_mfcc(self, samples: np.ndarray) -> np.ndarray:
+        """Extract MFCC features from audio samples."""
+        import librosa
+
+        # Convert to float
+        y = samples.astype(np.float32) / 32768.0
+
+        # Extract MFCC
+        hop_length = int(self.sample_rate * self.hop_duration_ms / 1000)
+        mfcc = librosa.feature.mfcc(
+            y=y,
+            sr=self.sample_rate,
+            n_mfcc=self.n_mfcc,
+            n_fft=2048,
+            hop_length=hop_length
+        )
+
+        # Transpose to (n_frames, n_mfcc)
+        return mfcc.T
+
+    def detect(self, samples: np.ndarray) -> dict:
+        """
+        Run detection on audio samples.
+
+        Returns dict with detection result and confidence.
+        """
+        if self.model is None:
+            return {"detected": False, "confidence": 0.0, "error": "Model not loaded"}
+
+        # Add samples to buffer
+        self.audio_buffer = np.concatenate([self.audio_buffer, samples])
+
+        # Check if we have enough for a window
+        if len(self.audio_buffer) < self.window_samples:
+            return {"detected": False, "confidence": 0.0, "buffering": True}
+
+        # Extract window (most recent samples)
+        window = self.audio_buffer[-self.window_samples:]
+
+        # Extract MFCC features
+        mfcc = self.extract_mfcc(window)
+
+        # Expected shape from training
+        expected_frames = 50  # From training script
+
+        # Pad or truncate
+        if len(mfcc) < expected_frames:
+            mfcc = np.pad(mfcc, ((0, expected_frames - len(mfcc)), (0, 0)))
+        elif len(mfcc) > expected_frames:
+            mfcc = mfcc[:expected_frames]
+
+        # Reshape for model: (batch, frames, features)
+        mfcc_input = mfcc.reshape(1, expected_frames, self.n_mfcc)
+
+        # Run inference
+        prediction = self.model.predict(mfcc_input, verbose=0)[0][0]
+
+        # Threshold
+        is_beep = prediction > self.confidence_threshold
+
+        # Debounce
+        if is_beep:
+            self.consecutive_detections += 1
+        else:
+            self.consecutive_detections = 0
+
+        confirmed = self.consecutive_detections >= self.debounce_count
+
+        # Trim buffer to prevent memory growth (keep last window + some overlap)
+        max_buffer = self.window_samples * 2
+        if len(self.audio_buffer) > max_buffer:
+            self.audio_buffer = self.audio_buffer[-max_buffer:]
+
+        return {
+            "detected": confirmed,
+            "confidence": float(prediction),
+            "raw_detection": is_beep,
+            "consecutive": self.consecutive_detections,
+        }
+
+    def analyze_file(self, audio_path: str) -> list[dict]:
+        """
+        Analyze an audio file and return detections with timestamps.
+        """
+        import librosa
+
+        print(f"\nAnalyzing file: {audio_path}")
+
+        # Load audio
+        y, sr = librosa.load(audio_path, sr=self.sample_rate, mono=True)
+        print(f"  Duration: {len(y) / sr:.2f}s")
+        print(f"  Samples: {len(y)}")
+
+        # Convert to int16
+        samples = (y * 32768).astype(np.int16)
+
+        results = []
+        detections = []
+
+        # Slide window across audio
+        hop = self.window_samples // 2  # 50% overlap
+        for i in range(0, len(samples) - self.window_samples, hop):
+            window = samples[i:i + self.window_samples]
+
+            # Reset buffer for clean detection
+            self.audio_buffer = np.array([], dtype=np.int16)
+            self.consecutive_detections = 0
+
+            # Run detection
+            result = self.detect(window)
+            result["timestamp_ms"] = (i / sr) * 1000
+            result["timestamp_s"] = i / sr
+            results.append(result)
+
+            if result["confidence"] > self.confidence_threshold:
+                detections.append(result)
+
+        # Print summary
+        print(f"\n  Analysis complete:")
+        print(f"  Windows analyzed: {len(results)}")
+        print(f"  Detections (confidence > {self.confidence_threshold}): {len(detections)}")
+
+        if detections:
+            print(f"\n  Detection timestamps:")
+            for d in detections:
+                print(f"    {d['timestamp_s']:.2f}s: confidence={d['confidence']:.3f}")
+
+        return results
 
 
 class AudioStreamServer:
@@ -321,6 +512,51 @@ class AudioStreamServer:
         print(f"  Bytes received: {self.bytes_received}")
 
 
+def test_on_file(audio_path: str, model_path: str, confidence_threshold: float = 0.5):
+    """Test neural network detection on an audio file."""
+    print("\n" + "=" * 60)
+    print("Neural Network Beep Detection Test")
+    print("=" * 60)
+
+    detector = NeuralBeepDetector(
+        model_path=model_path,
+        confidence_threshold=confidence_threshold,
+    )
+
+    if detector.model is None:
+        print("\nERROR: Could not load model. Run train_beep_model.py first!")
+        return 1
+
+    results = detector.analyze_file(audio_path)
+
+    # Count detections
+    high_confidence = [r for r in results if r["confidence"] > 0.8]
+    medium_confidence = [r for r in results if 0.5 < r["confidence"] <= 0.8]
+    low_confidence = [r for r in results if 0.3 < r["confidence"] <= 0.5]
+
+    print(f"\n" + "=" * 60)
+    print("Detection Summary")
+    print("=" * 60)
+    print(f"  High confidence (>0.8): {len(high_confidence)}")
+    print(f"  Medium confidence (0.5-0.8): {len(medium_confidence)}")
+    print(f"  Low confidence (0.3-0.5): {len(low_confidence)}")
+
+    if high_confidence:
+        print(f"\n  High confidence detections:")
+        for r in high_confidence:
+            print(f"    {r['timestamp_s']:.2f}s - confidence: {r['confidence']:.3f}")
+
+    print("\n" + "=" * 60)
+    if high_confidence:
+        print("SUCCESS: Beeps detected in audio file!")
+    else:
+        print("WARNING: No high-confidence beeps detected.")
+        print("Try adjusting --confidence-threshold or retrain the model.")
+    print("=" * 60)
+
+    return 0 if high_confidence else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Audio Streaming Server for ESPHome Beep Detector"
@@ -355,9 +591,41 @@ def main():
     parser.add_argument(
         "--mqtt-port", type=int, default=1883, help="MQTT broker port (default: 1883)"
     )
+    parser.add_argument(
+        "--use-nn",
+        action="store_true",
+        help="Use neural network for beep detection instead of Goertzel",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default="models/beep_detector.keras",
+        help="Path to trained Keras model (default: models/beep_detector.keras)",
+    )
+    parser.add_argument(
+        "--confidence-threshold",
+        type=float,
+        default=0.5,
+        help="Confidence threshold for NN detection (default: 0.5)",
+    )
+    parser.add_argument(
+        "--test-file",
+        type=str,
+        default=None,
+        help="Test detection on an audio file instead of live UDP stream",
+    )
 
     args = parser.parse_args()
 
+    # Test on file mode
+    if args.test_file:
+        return test_on_file(
+            audio_path=args.test_file,
+            model_path=args.model_path,
+            confidence_threshold=args.confidence_threshold,
+        )
+
+    # Live UDP server mode
     server = AudioStreamServer(
         port=args.port,
         sample_rate=args.sample_rate,
@@ -371,4 +639,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    exit(main() or 0)
