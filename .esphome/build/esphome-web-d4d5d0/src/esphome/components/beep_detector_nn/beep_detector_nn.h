@@ -95,7 +95,7 @@ class BeepDetectorNNComponent : public Component {
   uint8_t debounce_count_{2};
 
   // State
-  bool enabled_{true};
+  bool enabled_{false};  // Start disabled - inference is too slow (16s) and blocks API
   bool initialized_{false};
   uint32_t detection_count_{0};
   uint8_t consecutive_detections_{0};
