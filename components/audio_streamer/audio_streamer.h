@@ -2,9 +2,13 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/microphone/microphone.h"
-#include <WiFiUdp.h>
+
 #include <vector>
 #include <string>
+
+// ESP-IDF socket includes
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
 
 namespace esphome {
 namespace audio_streamer {
@@ -35,10 +39,15 @@ class AudioStreamerComponent : public Component {
 
  protected:
   void stream_audio_data(const std::vector<uint8_t> &data);
+  bool init_socket();
+  void close_socket();
 
   // Components
   microphone::Microphone *microphone_{nullptr};
-  WiFiUDP udp_;
+
+  // Socket
+  int sock_{-1};
+  struct sockaddr_in dest_addr_{};
 
   // Configuration
   std::string target_ip_;

@@ -2,6 +2,9 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 
+#include <cstring>
+#include <arpa/inet.h>
+
 namespace esphome {
 namespace audio_streamer {
 
@@ -50,8 +53,40 @@ void AudioStreamerComponent::loop() {
   }
 }
 
+bool AudioStreamerComponent::init_socket() {
+  // Create UDP socket
+  this->sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (this->sock_ < 0) {
+    ESP_LOGE(TAG, "Failed to create socket: errno %d", errno);
+    return false;
+  }
+
+  // Set up destination address
+  memset(&this->dest_addr_, 0, sizeof(this->dest_addr_));
+  this->dest_addr_.sin_family = AF_INET;
+  this->dest_addr_.sin_port = htons(this->target_port_);
+
+  // Convert IP address string to binary
+  if (inet_pton(AF_INET, this->target_ip_.c_str(), &this->dest_addr_.sin_addr) <= 0) {
+    ESP_LOGE(TAG, "Invalid IP address: %s", this->target_ip_.c_str());
+    close(this->sock_);
+    this->sock_ = -1;
+    return false;
+  }
+
+  ESP_LOGI(TAG, "UDP socket created for %s:%d", this->target_ip_.c_str(), this->target_port_);
+  return true;
+}
+
+void AudioStreamerComponent::close_socket() {
+  if (this->sock_ >= 0) {
+    close(this->sock_);
+    this->sock_ = -1;
+  }
+}
+
 void AudioStreamerComponent::stream_audio_data(const std::vector<uint8_t> &data) {
-  if (data.empty()) {
+  if (data.empty() || this->sock_ < 0) {
     return;
   }
 
@@ -69,17 +104,14 @@ void AudioStreamerComponent::stream_audio_data(const std::vector<uint8_t> &data)
   this->send_buffer_.insert(this->send_buffer_.end(), data.begin(), data.end());
 
   // Send UDP packet
-  if (this->udp_.beginPacket(this->target_ip_.c_str(), this->target_port_)) {
-    size_t written = this->udp_.write(this->send_buffer_.data(), this->send_buffer_.size());
-    if (this->udp_.endPacket()) {
-      this->packets_sent_++;
-      this->bytes_sent_ += written;
-    } else {
-      ESP_LOGW(TAG, "Failed to send UDP packet");
-    }
+  ssize_t sent = sendto(this->sock_, this->send_buffer_.data(), this->send_buffer_.size(), 0,
+                        (struct sockaddr *)&this->dest_addr_, sizeof(this->dest_addr_));
+
+  if (sent > 0) {
+    this->packets_sent_++;
+    this->bytes_sent_ += sent;
   } else {
-    ESP_LOGW(TAG, "Failed to begin UDP packet to %s:%d",
-             this->target_ip_.c_str(), this->target_port_);
+    ESP_LOGW(TAG, "Failed to send UDP packet: errno %d", errno);
   }
 }
 
@@ -97,8 +129,11 @@ void AudioStreamerComponent::start_streaming() {
   ESP_LOGI(TAG, "Starting audio stream to %s:%d",
            this->target_ip_.c_str(), this->target_port_);
 
-  // Start the UDP client
-  this->udp_.begin(0);  // Use any available local port
+  // Initialize the UDP socket
+  if (!this->init_socket()) {
+    ESP_LOGE(TAG, "Failed to initialize socket");
+    return;
+  }
 
   // Start the microphone if not already running
   this->microphone_->start();
@@ -120,7 +155,7 @@ void AudioStreamerComponent::stop_streaming() {
   ESP_LOGI(TAG, "Stopping audio stream");
 
   this->streaming_active_ = false;
-  this->udp_.stop();
+  this->close_socket();
 
   // Note: We don't stop the microphone here in case beep_detector is also using it
 

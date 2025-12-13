@@ -4,6 +4,7 @@
 
 #include <cstdint>
 
+namespace esphome {
 namespace beep_detector_nn {
 
 // conv1d: kernel shape (3, 20, 8), bias shape (8,)
@@ -518,3 +519,4 @@ static const int DENSE1_UNITS = 16;
 static const int DENSE2_UNITS = 8;
 
 }  // namespace beep_detector_nn
+}  // namespace esphome
