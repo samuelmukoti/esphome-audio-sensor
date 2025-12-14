@@ -31,7 +31,7 @@ Thumbs.db
 # Logs
 *.log
 *.txt
-!README*.txt
+!requirements.txt
 
 # Training data (large files)
 tools/recordings/
@@ -50,6 +50,22 @@ server/models/*.keras
 *.m4a
 *.mp3
 
+# Images
+*.png
+*.jpg
+*.jpeg
+
 # Temporary files
 *.tmp
 *.bak
+
+# Research/development artifacts
+research/
+.claude-flow/
+
+# Analysis scripts (kept in tools/)
+analyze_audio.py
+simple_audio_analysis.py
+detailed_freq_analysis.py
+audio_analysis_report.json
+spectrogram.png

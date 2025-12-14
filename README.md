@@ -1,476 +1,175 @@
-# ESPHome Audio Beep Detector - Architecture Design
-## Water Heater Beep Detection System for M5Stack Atom Echo
+# ESPHome Audio Beep Detector
 
----
+Real-time beep detection system using ESP32 with neural network inference for Home Assistant integration.
 
-## Project Overview
+## Overview
 
-This repository contains the complete architecture design for an ESPHome-based beep detection system. The system uses an M5Stack Atom Echo (ESP32 with I2S microphone) to detect water heater error beeps in real-time and integrate with Home Assistant for alerting and automation.
-
-**Status:** Architecture Design Complete ✅
-**Next Steps:** Audio analysis → Component implementation → Testing
-
----
-
-## Quick Navigation
-
-| Document | Purpose | Audience |
-|----------|---------|----------|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Complete technical specification | Developers, implementers |
-| [QUICK_START.md](QUICK_START.md) | Fast implementation guide | Getting started quickly |
-| [DIAGRAMS.md](DIAGRAMS.md) | Visual architecture diagrams | Visual learners, architects |
-| This README | Project overview and index | Everyone |
-
----
-
-## Architecture Highlights
-
-### System Capabilities
-
-✅ **Real-time Detection:** <500ms latency from beep to notification
-✅ **Low Resource Usage:** <10% CPU, <10KB memory on ESP32
-✅ **Frequency Selective:** Distinguish beeps from background noise
-✅ **Configurable via YAML:** No firmware changes for tuning
-✅ **Home Assistant Native:** Seamless integration via ESPHome API
-✅ **Production Ready:** Reliable, maintainable, well-documented
-
-### Key Design Decisions
-
-| Aspect | Decision | Rationale |
-|--------|----------|-----------|
-| **Sample Rate** | 16 kHz | Sufficient for <8kHz beeps, low CPU |
-| **Buffer Size** | 512 samples | 32ms chunks, good time resolution |
-| **Detection Method** | Goertzel (recommended) | Frequency-selective, efficient |
-| **Language** | C++ + YAML | Performance + configurability |
-| **Framework** | ESPHome + ESP-IDF | Mature ecosystem, HA integration |
-
-### Three Processing Options
-
-#### 1. RMS Energy Detection (Simplest)
-- **Complexity:** Low - Pure YAML possible
-- **Performance:** <1% CPU, <1KB memory
-- **Use case:** Any loud beep, no frequency selectivity
-- **Implementation time:** 2 hours
-
-#### 2. Goertzel Algorithm (Recommended)
-- **Complexity:** Medium - Custom C++ component
-- **Performance:** ~5% CPU, ~1KB memory
-- **Use case:** Known frequency beep (e.g., 2kHz)
-- **Implementation time:** 6 hours
-
-#### 3. FFT Spectrum Analysis (Advanced)
-- **Complexity:** High - Advanced DSP
-- **Performance:** ~50% CPU, ~5KB memory
-- **Use case:** Unknown frequency, research mode
-- **Implementation time:** 12 hours
-
----
-
-## Component Architecture
+This project provides a beep detection system that:
+- Streams audio from an ESP32 (M5Stack Atom Echo) via UDP
+- Runs neural network inference on a server for accurate detection
+- Sends detection results back to ESP32 for Home Assistant integration
+- Includes a web dashboard for training and active learning
 
 ```
-Home Assistant
-    ↕ ESPHome API (Wi-Fi)
-ESPHome Firmware
-    ├─ Binary Sensor (ON/OFF state)
-    ├─ Energy Sensor (diagnostics)
-    ├─ Frequency Sensor (diagnostics)
-    └─ Beep Detector Component
-        ├─ Audio Capture (I2S microphone)
-        ├─ Preprocessing (DC removal, filtering)
-        ├─ Feature Extraction (RMS/Goertzel/FFT)
-        ├─ Detection Logic (thresholds, patterns)
-        └─ State Management (debouncing, hysteresis)
-ESP32 Hardware
-    └─ SPM1423 MEMS Microphone (I2S digital)
+┌──────────────┐     UDP:5050      ┌─────────────────────┐
+│    ESP32     │ ──────────────>   │   Beep Detection    │
+│  (M5 Atom)   │                   │      Server         │
+│              │ <──────────────   │   (Docker/Python)   │
+│  - PDM Mic   │     UDP:5001      │                     │
+│  - WiFi      │                   │  - Neural Network   │
+└──────────────┘                   │  - Web Dashboard    │
+       │                           │  - Active Learning  │
+       │ API                       └─────────────────────┘
+       v                                    │
+┌──────────────┐                           │ :8080
+│ Home         │ <─────────────────────────┘
+│ Assistant    │
+└──────────────┘
 ```
 
-**See [DIAGRAMS.md](DIAGRAMS.md) for detailed visual representations.**
+## Quick Start
 
----
+### 1. Deploy the Detection Server
 
-## Configuration Example
+```bash
+# Using Docker Compose (recommended)
+git clone https://github.com/samuelmukoti/esphome-audio-sensor.git
+cd esphome-audio-sensor
+docker-compose up -d
+
+# View logs
+docker-compose logs -f beep-detector
+```
+
+Or pull from GitHub Container Registry:
+```bash
+docker pull ghcr.io/samuelmukoti/esphome-audio-sensor/beep-detector:latest
+docker run -d --name beep-detector \
+  -p 8080:8080 -p 5050:5050/udp -p 5001:5001/udp \
+  ghcr.io/samuelmukoti/esphome-audio-sensor/beep-detector:latest
+```
+
+### 2. Flash ESP32 Firmware
+
+1. Copy `esphome-atom-d4d5d0.yaml` to your ESPHome config directory
+2. Create `secrets.yaml`:
+   ```yaml
+   wifi_ssid: "your_wifi_ssid"
+   wifi_password: "your_wifi_password"
+   api_encryption_key: "your_32_byte_base64_key"
+   ota_password: "your_ota_password"
+   ```
+3. Update server IP in the YAML config
+4. Flash via ESPHome dashboard or CLI:
+   ```bash
+   esphome run esphome-atom-d4d5d0.yaml
+   ```
+
+### 3. Access the Dashboard
+
+Open `http://YOUR_SERVER_IP:8080` to access:
+- Live audio visualization
+- Detection confidence meter
+- Training mode controls
+- Sample labeling interface
+
+## Components
+
+### ESPHome Custom Components
+
+| Component | Description |
+|-----------|-------------|
+| `audio_streamer` | Streams PDM microphone audio via UDP |
+| `detection_receiver` | Receives detection results from server |
+| `beep_detector` | Simple on-device energy detection |
+| `beep_detector_nn` | On-device neural network (experimental) |
+
+### Using Components in Your Project
 
 ```yaml
-# Minimal working configuration
-esphome:
-  name: beep-detector
-  friendly_name: Water Heater Monitor
+external_components:
+  - source:
+      type: git
+      url: https://github.com/samuelmukoti/esphome-audio-sensor
+      ref: main
+    components: [audio_streamer, detection_receiver]
 
-esp32:
-  variant: esp32
-  framework:
-    type: esp-idf
+audio_streamer:
+  id: audio_stream
+  server_ip: "192.168.1.100"
+  server_port: 5050
+  sample_rate: 16000
 
-# I2S Microphone
-i2s_audio:
-  - id: i2s_mic
-    i2s_lrclk_pin: GPIO33
-    i2s_bclk_pin: GPIO19
-
-microphone:
-  - platform: i2s_audio
-    id: atom_mic
-    i2s_audio_id: i2s_mic
-    i2s_din_pin: GPIO22
-    adc_type: external
-    sample_rate: 16000
-    bits_per_sample: 16bit
-
-# Custom beep detector (requires custom component)
-beep_detector:
-  id: water_heater_beep
-  microphone_id: atom_mic
-  detection_method: goertzel
-  target_frequency: 2000      # Hz
-  energy_threshold: 1000      # RMS
-  frequency_tolerance: 100    # ±Hz
-  min_consecutive_detections: 3
-  debounce_time: 200ms
-
-# Binary sensor output
-binary_sensor:
-  - platform: beep_detector
-    beep_detector_id: water_heater_beep
-    name: "Water Heater Beeping"
-    device_class: problem
-    on_press:
-      - homeassistant.event:
-          event: esphome.water_heater_beep
+detection_receiver:
+  id: detector
+  listen_port: 5001
+  on_detection:
+    - logger.log: "Beep detected!"
 ```
 
-**See [ARCHITECTURE.md Section 4.3](ARCHITECTURE.md#43-yaml-configuration-design) for complete configuration.**
+## Architecture
 
----
+- **ESP32**: Captures audio via I2S PDM microphone, streams over UDP
+- **Detection Server**: Python Flask app with TensorFlow model
+- **Neural Network**: CNN trained on MFCC features (13 coefficients, 25 frames)
+- **Active Learning**: Web interface for labeling samples and retraining
 
-## Performance Specifications
+## Ports
 
-### Processing Performance (ESP32 @ 240MHz)
+| Port | Protocol | Description |
+|------|----------|-------------|
+| 8080 | TCP | Web dashboard |
+| 5050 | UDP | Audio stream from ESP32 |
+| 5001 | UDP | Detection results to ESP32 |
 
-| Method | CPU Usage | Memory | Latency | Frequency Selectivity |
-|--------|-----------|--------|---------|----------------------|
-| RMS | <1% | 1 KB | 100ms | ❌ None |
-| Goertzel | ~5% | 1 KB | 200ms | ✅ Single frequency |
-| FFT | ~50% | 5 KB | 500ms | ✅ Full spectrum |
+## Training Your Own Model
 
-### System Performance Targets
+1. Enable training mode in the dashboard
+2. Collect samples:
+   - Click "Mark Beep NOW" when you hear a beep
+   - Label detected sounds in "Pending Review"
+3. Click "Retrain Model"
+4. Test and iterate
 
-- ✅ **Detection Latency:** <500ms (from beep start to HA notification)
-- ✅ **False Positive Rate:** <1 per 24 hours
-- ✅ **False Negative Rate:** <1%
-- ✅ **Wi-Fi Reliability:** >99.9% uptime
-- ✅ **Power Consumption:** <500mW (USB powered)
+## Hardware
 
----
-
-## Implementation Roadmap
-
-### Phase 1: Audio Analysis (Current)
-- [x] Architecture design complete
-- [ ] Analyze sample audio file for beep characteristics
-- [ ] Identify target frequency and amplitude
-- [ ] Determine optimal detection method
-
-### Phase 2: Component Development
-- [ ] Create custom ESPHome component structure
-- [ ] Implement I2S audio capture
-- [ ] Develop chosen signal processing method
-- [ ] Add detection logic and state management
-- [ ] Create YAML configuration interface
-
-### Phase 3: Testing & Calibration
-- [ ] Unit test individual processing stages
-- [ ] Integration test with actual water heater
-- [ ] Calibrate thresholds for environment
-- [ ] 24-hour reliability testing
-- [ ] Performance benchmarking
-
-### Phase 4: Deployment
-- [ ] Flash firmware to M5Stack Atom Echo
-- [ ] Physical installation near water heater
-- [ ] Home Assistant automation setup
-- [ ] User documentation
-- [ ] Monitoring and maintenance procedures
-
----
-
-## File Structure
-
-```
-esphome-audio-sensor/
-├── README.md                          # This file - project overview
-├── ARCHITECTURE.md                    # Complete technical specification
-├── QUICK_START.md                     # Fast implementation guide
-├── DIAGRAMS.md                        # Visual architecture diagrams
-├── esphome-atom-d4d5d0.yaml          # Current ESPHome config
-├── water_heater_beeping_error_sound.m4a  # Sample audio for analysis
-└── components/                        # Custom ESPHome components (TBD)
-    └── beep_detector/
-        ├── __init__.py               # Python validation
-        ├── beep_detector.h           # C++ header
-        ├── beep_detector.cpp         # C++ implementation
-        └── audio_processor.cpp       # DSP algorithms
-```
-
----
-
-## Hardware Requirements
-
-### M5Stack Atom Echo Specifications
-
-**Microcontroller:**
+**M5Stack Atom Echo:**
 - ESP32-PICO (240MHz dual-core)
-- 520KB SRAM, 4MB Flash
-- Wi-Fi 802.11 b/g/n
-
-**Microphone:**
 - SPM1423 I2S MEMS microphone
-- Omnidirectional pattern
-- 100Hz - 10kHz frequency response
-- 61dB SNR
-
-**Power:**
-- USB-C 5V input
-- ~300mW typical consumption
+- USB-C powered
 
 **I2S Pin Configuration:**
 - BCLK: GPIO 19
 - LRCLK: GPIO 33
 - DATA_IN: GPIO 22
 
----
+## Project Structure
 
-## Software Dependencies
-
-### ESPHome Platform
-- ESPHome ≥ 2025.9.0
-- ESP-IDF framework (specified in config)
-- Home Assistant integration
-
-### Optional Libraries
-- ESP-DSP (for optimized FFT)
-- ESP32 Arduino Core (alternative framework)
-
-### Development Tools
-- ESPHome CLI or dashboard
-- Home Assistant instance
-- Audio analysis tools (Audacity, Python scipy)
-
----
-
-## Integration with Home Assistant
-
-### Exposed Entities
-
-**Binary Sensor:**
-- `binary_sensor.water_heater_beeping` - Main detection output
-- Device class: `problem`
-- State: ON (beeping) / OFF (silent)
-
-**Diagnostic Sensors:**
-- `sensor.audio_energy_level` - Real-time RMS value
-- `sensor.detected_frequency` - Measured frequency (Hz)
-- `sensor.wifi_signal` - Connection quality
-- `sensor.uptime` - Device uptime
-
-### Automation Example
-
-```yaml
-automation:
-  - alias: "Water Heater Alert"
-    trigger:
-      - platform: state
-        entity_id: binary_sensor.water_heater_beeping
-        to: "on"
-    action:
-      - service: notify.mobile_app
-        data:
-          title: "🚨 Water Heater Alert"
-          message: "Water heater is beeping - check for error!"
-      - service: light.turn_on
-        target:
-          entity_id: light.alert_light
-        data:
-          rgb_color: [255, 0, 0]
+```
+esphome-audio-sensor/
+├── components/              # ESPHome custom components
+│   ├── audio_streamer/      # UDP audio streaming
+│   ├── detection_receiver/  # Receive detection results
+│   ├── beep_detector/       # Simple energy detection
+│   └── beep_detector_nn/    # On-device neural network
+├── server/                  # Detection server
+│   ├── audio_server.py      # Main server application
+│   ├── Dockerfile           # Container definition
+│   ├── models/              # Trained models
+│   └── requirements.txt     # Python dependencies
+├── tools/                   # Training and analysis tools
+├── .github/workflows/       # CI/CD pipelines
+├── docker-compose.yml       # Container orchestration
+├── esphome-atom-d4d5d0.yaml # Example ESPHome config
+└── DEPLOY.md                # Deployment guide
 ```
 
----
+## CI/CD
 
-## Calibration & Tuning
-
-### Initial Setup Steps
-
-1. **Baseline Capture:** Monitor ambient noise for 1 hour
-2. **Frequency Identification:** Trigger test beep, analyze spectrum
-3. **Threshold Tuning:** Adjust until reliable detection
-4. **Validation:** 24-hour monitoring for false positives
-
-### Key Parameters to Adjust
-
-| Parameter | Conservative | Balanced | Aggressive |
-|-----------|--------------|----------|------------|
-| `energy_threshold` | 3000 | 1000 | 500 |
-| `min_consecutive_detections` | 5 | 3 | 2 |
-| `frequency_tolerance` | 50 Hz | 100 Hz | 200 Hz |
-| `debounce_time` | 500ms | 200ms | 100ms |
-
-**See [ARCHITECTURE.md Section 8](ARCHITECTURE.md#8-calibration--tuning-guide) for detailed tuning guide.**
-
----
-
-## Troubleshooting
-
-### Common Issues
-
-**No detection:**
-1. Check I2S wiring (GPIO 19, 33, 22)
-2. Verify microphone functioning (check energy sensor)
-3. Lower energy threshold
-4. Enable debug logging
-
-**Too many false positives:**
-1. Increase energy threshold
-2. Narrow frequency tolerance
-3. Increase min_consecutive_detections
-4. Check for noise sources (HVAC, TV)
-
-**High CPU usage:**
-1. Switch from FFT to Goertzel
-2. Reduce sample rate to 8kHz
-3. Increase buffer size (less frequent processing)
-
-**Wi-Fi disconnections:**
-1. Improve signal strength (closer to router/add extender)
-2. Check power supply quality
-3. Reduce processing load
-
-**See [ARCHITECTURE.md Section 11](ARCHITECTURE.md#11-troubleshooting-guide) for complete troubleshooting guide.**
-
----
-
-## Future Enhancements
-
-### Phase 2 Features (Potential)
-
-🔮 **Machine Learning:** TensorFlow Lite on-device classification
-🔮 **Multi-Pattern:** Detect different beep types (error vs. alert)
-🔮 **Multi-Appliance:** Water heater + smoke alarm + dryer
-🔮 **Directional:** Stereo microphone for sound localization
-🔮 **Cloud Analytics:** Historical pattern analysis
-🔮 **Predictive Alerts:** Detect increasing beep frequency (degradation)
-
----
-
-## Technical Documentation
-
-### Key Algorithms Explained
-
-**Goertzel Algorithm:**
-- Efficient single-frequency DFT (Discrete Fourier Transform)
-- Complexity: O(n) vs O(n log n) for full FFT
-- Ideal for known target frequencies
-- Memory efficient (16 bytes state)
-
-**Detection State Machine:**
-- IDLE → DETECTING(n) → ACTIVE → DEBOUNCE → IDLE
-- Hysteresis prevents rapid ON/OFF toggling
-- Configurable thresholds and timing
-
-**Signal Preprocessing:**
-- DC offset removal (eliminate microphone bias)
-- High-pass filter (remove low-frequency noise <100Hz)
-- Window functions (reduce spectral leakage for FFT)
-
-**See [ARCHITECTURE.md Section 3](ARCHITECTURE.md#3-processing-pipeline-design) for detailed algorithm descriptions.**
-
----
-
-## Testing Strategy
-
-### Unit Tests
-- ✅ Silent environment (no false positives)
-- ✅ Target beep detection (correct frequency)
-- ✅ Off-frequency rejection (frequency selectivity)
-- ✅ Brief transient filtering (duration check)
-- ✅ Repeated beep handling (debouncing)
-
-### Integration Tests
-- ✅ Real-world noise (TV, conversation, HVAC)
-- ✅ Wi-Fi dropout recovery
-- ✅ 24-hour reliability (false alarm rate)
-- ✅ Power cycle recovery
-- ✅ OTA update stability
-
-**See [ARCHITECTURE.md Section 9](ARCHITECTURE.md#9-testing--validation) for complete test plan.**
-
----
-
-## Resources & References
-
-### Documentation
-- [ESPHome I2S Audio](https://esphome.io/components/i2s_audio.html)
-- [ESP32 I2S Driver API](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/i2s.html)
-- [M5Stack Atom Echo](https://docs.m5stack.com/en/core/atom_echo)
-
-### Algorithms
-- [Goertzel Algorithm](https://en.wikipedia.org/wiki/Goertzel_algorithm)
-- [ESP-DSP Library](https://github.com/espressif/esp-dsp)
-- [Digital Signal Processing Guide](https://www.dspguide.com/)
-
-### Similar Projects
-- [ESPHome Voice Assistant](https://esphome.io/components/voice_assistant.html)
-- [WLED Audio Reactive](https://github.com/atuline/WLED-audio-reactive-LED-strip)
-
----
-
-## Contributing
-
-This is an architecture design project. Contributions welcome for:
-
-- 🐛 Bug reports in architecture assumptions
-- 💡 Design improvement suggestions
-- 📝 Documentation clarifications
-- 🔬 Testing results and findings
-- 🎯 Implementation examples
-
----
+GitHub Actions automatically:
+- **Docker Build**: Builds multi-arch images (amd64/arm64) and pushes to GHCR
+- **ESPHome Build**: Validates config and builds firmware artifacts
 
 ## License
 
-This architecture documentation is provided as-is for educational and implementation purposes.
-
----
-
-## Authors
-
-**Architecture Design Team**
-- Backend Architecture Specialist
-- Signal Processing Expert
-- ESPHome Integration Specialist
-
-**Project Context:**
-- Hardware: M5Stack Atom Echo (ESP32 + I2S microphone)
-- Use Case: Water heater error beep detection
-- Integration: Home Assistant via ESPHome
-
----
-
-## Acknowledgments
-
-- ESPHome community for excellent framework
-- ESP32 community for comprehensive documentation
-- Home Assistant community for automation platform
-- M5Stack for accessible ESP32 hardware
-
----
-
-**Project Status:** Architecture Complete - Ready for Implementation
-
-**Next Steps:**
-1. Audio analysis of sample file → Determine beep frequency
-2. Choose detection method → Based on frequency analysis
-3. Implement custom component → Following architecture specs
-4. Test and calibrate → Real-world validation
-5. Deploy and monitor → Production operation
-
-For questions or clarifications, refer to detailed documentation in ARCHITECTURE.md.
+MIT License
