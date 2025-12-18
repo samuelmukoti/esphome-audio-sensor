@@ -21,7 +21,11 @@ Usage:
     # Open dashboard at http://localhost:8080
 
 Requirements:
-    pip install numpy scipy tensorflow librosa flask
+    pip install numpy scipy librosa flask
+    # For inference only (no AVX required):
+    pip install tflite-runtime
+    # For full training support (requires AVX):
+    pip install tensorflow
 """
 
 import argparse
@@ -40,6 +44,24 @@ from pathlib import Path
 
 import numpy as np
 
+# Try to import TFLite runtime first (smaller, no AVX required)
+# Fall back to full TensorFlow if TFLite not available
+TFLITE_AVAILABLE = False
+TF_AVAILABLE = False
+
+try:
+    import tflite_runtime.interpreter as tflite
+    TFLITE_AVAILABLE = True
+    print("[INFO] Using TFLite runtime for inference (no AVX required)")
+except ImportError:
+    try:
+        import tensorflow as tf
+        TF_AVAILABLE = True
+        print("[INFO] Using TensorFlow for inference")
+    except Exception as e:
+        print(f"[WARNING] Neither tflite-runtime nor tensorflow available: {e}")
+        print("[WARNING] Model inference will be disabled")
+
 # Flask for web dashboard
 try:
     from flask import Flask, render_template_string, jsonify, request, send_file
@@ -57,7 +79,9 @@ class DetectionEvent:
     """Stores a detection event with audio for labeling."""
 
     def __init__(self, event_id: str, timestamp: datetime, confidence: float,
-                 audio_samples: np.ndarray, sample_rate: int):
+                 audio_samples: np.ndarray, sample_rate: int,
+                 source_type: str = "auto_detection",
+                 detection_offset_ms: Optional[int] = None):
         self.id = event_id
         self.timestamp = timestamp
         self.confidence = confidence
@@ -65,15 +89,23 @@ class DetectionEvent:
         self.sample_rate = sample_rate
         self.label: Optional[bool] = None  # None=unlabeled, True=beep, False=not beep
         self.labeled_at: Optional[datetime] = None
+        # New fields for enhanced dashboard
+        self.source_type = source_type  # "auto_detection" or "manual_capture"
+        self.detection_offset_ms = detection_offset_ms  # Position of detection in clip
+        self.notes: str = ""  # User notes
 
     def to_dict(self) -> dict:
         return {
             "id": self.id,
             "timestamp": self.timestamp.isoformat(),
             "confidence": self.confidence,
-            "duration_ms": len(self.audio_samples) / self.sample_rate * 1000,
+            "duration_ms": len(self.audio_samples) / self.sample_rate * 1000 if len(self.audio_samples) > 0 else 0,
             "label": self.label,
             "labeled_at": self.labeled_at.isoformat() if self.labeled_at else None,
+            "source_type": self.source_type,
+            "detection_offset_ms": self.detection_offset_ms,
+            "sample_rate": self.sample_rate,
+            "notes": self.notes,
         }
 
     def save_audio(self, directory: str) -> str:
@@ -94,11 +126,21 @@ class DetectionEvent:
 class LabelingStore:
     """Manages detection events and labels for reinforcement learning."""
 
+    SCHEMA_VERSION = 2  # Current schema version
+
     def __init__(self, data_dir: str = "labeled_data"):
         self.data_dir = data_dir
         self.audio_dir = os.path.join(data_dir, "audio")
         self.events: Dict[str, DetectionEvent] = {}
         self.max_events = 500  # Keep more events in memory for training
+        self.training_history: List[dict] = []  # History of training runs
+        # Configurable capture settings
+        self.settings = {
+            "auto_capture_enabled": True,
+            "capture_duration_seconds": 5,
+            "capture_confidence_min": 0.0,
+            "capture_confidence_max": 1.0,
+        }
 
         os.makedirs(self.audio_dir, exist_ok=True)
         self._load_labels()
@@ -107,44 +149,93 @@ class LabelingStore:
         return os.path.join(self.data_dir, "labels.json")
 
     def _load_labels(self):
-        """Load existing labels from disk and restore events."""
+        """Load existing labels from disk and restore events with schema migration."""
         labels_file = self._labels_file()
         if os.path.exists(labels_file):
             with open(labels_file, 'r') as f:
                 data = json.load(f)
-                labeled_data = data.get('labeled', [])
 
-                # Restore events from saved labels
-                for item in labeled_data:
-                    event_id = item['id']
-                    audio_path = os.path.join(self.audio_dir, f"{event_id}.wav")
+            # Schema migration: v1 -> v2
+            needs_migration = 'version' not in data or data.get('version', 1) < self.SCHEMA_VERSION
+            if needs_migration:
+                print("[MIGRATION] Upgrading labels.json to schema v2...")
+                data['version'] = self.SCHEMA_VERSION
+                data.setdefault('training_history', [])
+                data.setdefault('settings', {
+                    'auto_capture_enabled': True,
+                    'capture_duration_seconds': 5,
+                    'capture_confidence_min': 0.0,
+                    'capture_confidence_max': 1.0,
+                })
 
-                    # Only restore if audio file still exists
-                    if os.path.exists(audio_path):
-                        # Create event without audio samples (we'll load from disk when needed)
-                        event = DetectionEvent(
-                            event_id=event_id,
-                            timestamp=datetime.fromisoformat(item['timestamp']),
-                            confidence=item['confidence'],
-                            audio_samples=np.array([], dtype=np.int16),  # Empty, loaded from file
-                            sample_rate=16000,
-                        )
-                        event.label = item['label']
-                        if item.get('labeled_at'):
-                            event.labeled_at = datetime.fromisoformat(item['labeled_at'])
+                # Upgrade each sample
+                for item in data.get('labeled', []):
+                    # Infer source_type from confidence (0 = manual capture)
+                    if item.get('confidence', 0) == 0:
+                        item['source_type'] = 'manual_capture'
+                        item['detection_offset_ms'] = None
+                    else:
+                        item['source_type'] = 'auto_detection'
+                        # Estimate detection offset (end of clip minus detection window)
+                        duration = item.get('duration_ms', 2000)
+                        item['detection_offset_ms'] = max(0, int(duration - 500))
 
-                        self.events[event_id] = event
+                    item.setdefault('sample_rate', 16000)
+                    item.setdefault('notes', '')
 
-                print(f"[LABELING] Restored {len(self.events)} labeled samples from disk")
+            # Load training history and settings
+            self.training_history = data.get('training_history', [])
+            stored_settings = data.get('settings', {})
+            self.settings.update(stored_settings)
+
+            labeled_data = data.get('labeled', [])
+
+            # Restore events from saved labels
+            for item in labeled_data:
+                event_id = item['id']
+                audio_path = os.path.join(self.audio_dir, f"{event_id}.wav")
+
+                # Only restore if audio file still exists
+                if os.path.exists(audio_path):
+                    # Create event without audio samples (we'll load from disk when needed)
+                    event = DetectionEvent(
+                        event_id=event_id,
+                        timestamp=datetime.fromisoformat(item['timestamp']),
+                        confidence=item['confidence'],
+                        audio_samples=np.array([], dtype=np.int16),  # Empty, loaded from file
+                        sample_rate=item.get('sample_rate', 16000),
+                        source_type=item.get('source_type', 'auto_detection'),
+                        detection_offset_ms=item.get('detection_offset_ms'),
+                    )
+                    event.label = item['label']
+                    event.notes = item.get('notes', '')
+                    if item.get('labeled_at'):
+                        event.labeled_at = datetime.fromisoformat(item['labeled_at'])
+
+                    self.events[event_id] = event
+
+            # Save migrated data
+            if needs_migration:
+                self._save_labels()
+                print(f"[MIGRATION] Completed. Upgraded {len(self.events)} samples.")
+
+            print(f"[LABELING] Restored {len(self.events)} labeled samples from disk")
 
     def _save_labels(self):
-        """Save labels to disk."""
+        """Save labels to disk with v2 schema."""
         labeled = [e.to_dict() for e in self.events.values() if e.label is not None]
+        data = {
+            "version": self.SCHEMA_VERSION,
+            "labeled": labeled,
+            "training_history": self.training_history,
+            "settings": self.settings,
+        }
         with open(self._labels_file(), 'w') as f:
-            json.dump({"labeled": labeled}, f, indent=2)
+            json.dump(data, f, indent=2)
 
     def add_event(self, confidence: float, audio_samples: np.ndarray,
-                  sample_rate: int) -> DetectionEvent:
+                  sample_rate: int, source_type: str = "auto_detection",
+                  detection_offset_ms: Optional[int] = None) -> DetectionEvent:
         """Add a new detection event."""
         event_id = datetime.now().strftime("%Y%m%d_%H%M%S_") + str(uuid.uuid4())[:8]
         event = DetectionEvent(
@@ -153,6 +244,8 @@ class LabelingStore:
             confidence=confidence,
             audio_samples=audio_samples.copy(),
             sample_rate=sample_rate,
+            source_type=source_type,
+            detection_offset_ms=detection_offset_ms,
         )
 
         # Save audio immediately
@@ -216,6 +309,157 @@ class LabelingStore:
             "false_negatives": false_negatives,
             "precision": true_positives / len(labeled) if labeled else 0,
         }
+
+    def should_capture(self, confidence: float) -> bool:
+        """Check if detection should be captured based on settings."""
+        if not self.settings.get('auto_capture_enabled', True):
+            return False
+        conf_min = self.settings.get('capture_confidence_min', 0.0)
+        conf_max = self.settings.get('capture_confidence_max', 1.0)
+        return conf_min <= confidence <= conf_max
+
+    def update_settings(self, new_settings: dict) -> dict:
+        """Update capture settings and persist."""
+        self.settings.update(new_settings)
+        self._save_labels()
+        return self.settings
+
+    def add_training_run(self, samples_used: int, beeps: int, not_beeps: int,
+                         epochs: int, final_accuracy: float, final_loss: float = 0.0) -> dict:
+        """Record a training run in history."""
+        run = {
+            "timestamp": datetime.now().isoformat(),
+            "samples_used": samples_used,
+            "beeps": beeps,
+            "not_beeps": not_beeps,
+            "epochs": epochs,
+            "final_accuracy": final_accuracy,
+            "final_loss": final_loss,
+        }
+        self.training_history.append(run)
+        self._save_labels()
+        return run
+
+    def get_samples(self, sample_type: str = "all", source: str = "all",
+                    conf_min: float = 0.0, conf_max: float = 1.0,
+                    page: int = 1, per_page: int = 20) -> dict:
+        """Get filtered and paginated samples."""
+        # Start with all events
+        samples = list(self.events.values())
+
+        # Filter by type
+        if sample_type == "beep":
+            samples = [s for s in samples if s.label is True]
+        elif sample_type == "not_beep":
+            samples = [s for s in samples if s.label is False]
+        elif sample_type == "pending":
+            samples = [s for s in samples if s.label is None]
+
+        # Filter by source
+        if source == "auto":
+            samples = [s for s in samples if s.source_type == "auto_detection"]
+        elif source == "manual":
+            samples = [s for s in samples if s.source_type == "manual_capture"]
+
+        # Filter by confidence range
+        samples = [s for s in samples if conf_min <= s.confidence <= conf_max]
+
+        # Sort by timestamp (newest first)
+        samples = sorted(samples, key=lambda s: s.timestamp, reverse=True)
+
+        # Paginate
+        total = len(samples)
+        start = (page - 1) * per_page
+        end = start + per_page
+        page_samples = samples[start:end]
+
+        return {
+            "samples": [s.to_dict() for s in page_samples],
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "total_pages": (total + per_page - 1) // per_page if per_page > 0 else 0,
+        }
+
+    def update_sample(self, sample_id: str, label: Optional[bool] = None,
+                      notes: Optional[str] = None) -> bool:
+        """Update a sample's label or notes."""
+        if sample_id not in self.events:
+            return False
+
+        event = self.events[sample_id]
+        if label is not None:
+            event.label = label
+            event.labeled_at = datetime.now()
+        if notes is not None:
+            event.notes = notes
+
+        self._save_labels()
+        return True
+
+    def batch_label(self, sample_ids: List[str], label: bool) -> int:
+        """Label multiple samples at once."""
+        count = 0
+        for sample_id in sample_ids:
+            if sample_id in self.events:
+                self.events[sample_id].label = label
+                self.events[sample_id].labeled_at = datetime.now()
+                count += 1
+        if count > 0:
+            self._save_labels()
+        return count
+
+    def batch_delete(self, sample_ids: List[str]) -> int:
+        """Delete multiple samples at once."""
+        count = 0
+        for sample_id in sample_ids:
+            if sample_id in self.events:
+                # Delete audio file
+                audio_path = os.path.join(self.audio_dir, f"{sample_id}.wav")
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+                del self.events[sample_id]
+                count += 1
+        if count > 0:
+            self._save_labels()
+        return count
+
+    def get_waveform(self, sample_id: str, num_points: int = 500) -> Optional[dict]:
+        """Get downsampled waveform data for visualization."""
+        if sample_id not in self.events:
+            return None
+
+        audio_path = os.path.join(self.audio_dir, f"{sample_id}.wav")
+        if not os.path.exists(audio_path):
+            return None
+
+        try:
+            with wave.open(audio_path, 'rb') as wav:
+                n_frames = wav.getnframes()
+                sample_rate = wav.getframerate()
+                audio_data = wav.readframes(n_frames)
+                samples = np.frombuffer(audio_data, dtype=np.int16)
+
+            # Downsample to num_points
+            if len(samples) > num_points:
+                indices = np.linspace(0, len(samples) - 1, num_points, dtype=int)
+                downsampled = samples[indices]
+            else:
+                downsampled = samples
+
+            # Normalize to -1 to 1
+            normalized = downsampled.astype(float) / 32768.0
+
+            event = self.events[sample_id]
+            return {
+                "waveform": normalized.tolist(),
+                "duration_ms": len(samples) / sample_rate * 1000,
+                "sample_rate": sample_rate,
+                "detection_offset_ms": event.detection_offset_ms,
+            }
+        except Exception as e:
+            print(f"[ERROR] Failed to load waveform for {sample_id}: {e}")
+            return None
 
     def export_training_data(self) -> str:
         """Export labeled data for retraining."""
@@ -451,6 +695,16 @@ class LabelingStore:
         print(f"Training complete! Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
         print(f"{'='*60}\n")
 
+        # Record training run in history
+        self.add_training_run(
+            samples_used=len(X_new),
+            beeps=int(n_pos),
+            not_beeps=int(n_neg),
+            epochs=epochs,
+            final_accuracy=float(final_acc),
+            final_loss=float(final_loss),
+        )
+
         return {
             "success": True,
             "model_path": output_model_path,
@@ -512,20 +766,44 @@ class NeuralBeepDetector:
         print(f"  Debounce count: {debounce_count}")
 
     def _load_model(self, model_path: str):
-        """Load the trained Keras model."""
+        """Load the trained model (TFLite or Keras)."""
         self.model_path = model_path
-        try:
-            import tensorflow as tf
-            tf.get_logger().setLevel('ERROR')
+        self.use_tflite = False
+        self.tflite_interpreter = None
+        self.tflite_input_details = None
+        self.tflite_output_details = None
 
-            if os.path.exists(model_path):
-                self.model = tf.keras.models.load_model(model_path)
-                print(f"  Model loaded successfully")
-            else:
-                print(f"  WARNING: Model not found at {model_path}")
-                print(f"  Run train_beep_model.py first!")
-        except Exception as e:
-            print(f"  ERROR loading model: {e}")
+        # Try TFLite first (works on CPUs without AVX)
+        tflite_path = model_path.replace('.keras', '.tflite')
+        if TFLITE_AVAILABLE and os.path.exists(tflite_path):
+            try:
+                self.tflite_interpreter = tflite.Interpreter(model_path=tflite_path)
+                self.tflite_interpreter.allocate_tensors()
+                self.tflite_input_details = self.tflite_interpreter.get_input_details()
+                self.tflite_output_details = self.tflite_interpreter.get_output_details()
+                self.use_tflite = True
+                self.model = True  # Flag that model is loaded
+                print(f"  TFLite model loaded: {tflite_path}")
+                return
+            except Exception as e:
+                print(f"  TFLite load failed: {e}")
+
+        # Fall back to TensorFlow/Keras
+        if TF_AVAILABLE:
+            try:
+                tf.get_logger().setLevel('ERROR')
+                if os.path.exists(model_path):
+                    self.model = tf.keras.models.load_model(model_path)
+                    print(f"  Keras model loaded: {model_path}")
+                else:
+                    print(f"  WARNING: Model not found at {model_path}")
+                    print(f"  Run train_beep_model.py first!")
+            except Exception as e:
+                print(f"  ERROR loading Keras model: {e}")
+                self.model = None
+        else:
+            print(f"  WARNING: No model backend available")
+            print(f"  Install tflite-runtime or tensorflow")
             self.model = None
 
     def reload_model(self, model_path: str = None):
@@ -573,8 +851,19 @@ class NeuralBeepDetector:
         elif len(mfcc) > expected_frames:
             mfcc = mfcc[:expected_frames]
 
-        mfcc_input = mfcc.reshape(1, expected_frames, self.n_mfcc)
-        prediction = self.model.predict(mfcc_input, verbose=0)[0][0]
+        mfcc_input = mfcc.reshape(1, expected_frames, self.n_mfcc).astype(np.float32)
+
+        # Run inference using TFLite or Keras
+        if self.use_tflite:
+            self.tflite_interpreter.set_tensor(
+                self.tflite_input_details[0]['index'], mfcc_input
+            )
+            self.tflite_interpreter.invoke()
+            prediction = self.tflite_interpreter.get_tensor(
+                self.tflite_output_details[0]['index']
+            )[0][0]
+        else:
+            prediction = self.model.predict(mfcc_input, verbose=0)[0][0]
 
         is_beep = prediction > self.confidence_threshold
 
@@ -1030,11 +1319,424 @@ DASHBOARD_HTML = '''
             cursor: pointer;
         }
         .btn-delete:hover { background: #a00; }
+
+        /* Navigation */
+        .main-nav {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            padding: 15px 20px;
+            background: #0f0f23;
+            border-radius: 12px;
+            margin-bottom: 25px;
+            flex-wrap: wrap;
+        }
+        .nav-brand {
+            font-size: 1.4em;
+            font-weight: bold;
+            color: #00d4ff;
+        }
+        .nav-tabs {
+            display: flex;
+            gap: 5px;
+            flex: 1;
+        }
+        .nav-btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            background: #16213e;
+            color: #aaa;
+            cursor: pointer;
+            font-size: 0.95em;
+            transition: all 0.2s;
+        }
+        .nav-btn:hover { background: #1a3a5c; color: #fff; }
+        .nav-btn.active {
+            background: linear-gradient(135deg, #00d4ff, #0099cc);
+            color: #000;
+            font-weight: bold;
+        }
+        .nav-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 15px;
+            background: #16213e;
+            border-radius: 20px;
+            font-size: 0.85em;
+        }
+        .nav-status .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #666;
+        }
+        .nav-status .status-dot.connected { background: #00ff88; }
+
+        /* Page containers */
+        .page-content { display: none; }
+        .page-content.active { display: block; }
+
+        /* Settings panel */
+        .settings-panel {
+            background: #16213e;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .settings-row {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 15px;
+            flex-wrap: wrap;
+        }
+        .settings-row label { min-width: 150px; color: #aaa; }
+        .settings-row input[type="range"] { flex: 1; min-width: 100px; }
+        .settings-row input[type="checkbox"] { width: 20px; height: 20px; }
+        .settings-row .value-display {
+            min-width: 60px;
+            text-align: right;
+            color: #00d4ff;
+            font-weight: bold;
+        }
+
+        /* Training page */
+        .training-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+        .training-card {
+            background: #16213e;
+            padding: 25px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        .training-card .big-number {
+            font-size: 3em;
+            font-weight: bold;
+            color: #00d4ff;
+        }
+        .training-card.positive .big-number { color: #00ff88; }
+        .training-card.negative .big-number { color: #ff6b6b; }
+        .training-history-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        .training-history-table th,
+        .training-history-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #333;
+        }
+        .training-history-table th { color: #888; font-weight: normal; }
+        .training-history-table tr:hover { background: #1a3a5c; }
+
+        /* Dataset management page */
+        .filter-bar {
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+            background: #16213e;
+            padding: 15px 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+        .filter-bar select, .filter-bar input {
+            padding: 8px 12px;
+            border: 1px solid #333;
+            border-radius: 6px;
+            background: #0f0f23;
+            color: #fff;
+            font-size: 0.9em;
+        }
+        .filter-bar button {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .btn-filter { background: #00d4ff; color: #000; }
+        .btn-reset { background: #444; color: #fff; }
+        .batch-actions {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+            align-items: center;
+        }
+        .batch-actions .selection-count { color: #888; margin-right: 10px; }
+
+        /* Sample list with checkboxes */
+        .sample-list-item {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 15px;
+            background: #16213e;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        .sample-list-item:hover { background: #1a3a5c; }
+        .sample-list-item.selected { background: #1a4a6c; border: 1px solid #00d4ff; }
+        .sample-list-item input[type="checkbox"] { width: 18px; height: 18px; }
+        .sample-list-item .sample-info { flex: 1; }
+        .sample-list-item .sample-label {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+        .sample-list-item .sample-label.beep { background: #00ff88; color: #000; }
+        .sample-list-item .sample-label.not-beep { background: #ff6b6b; color: #000; }
+        .sample-list-item .sample-label.pending { background: #666; color: #fff; }
+
+        /* Sample row (for dataset management) */
+        .sample-row {
+            display: grid;
+            grid-template-columns: 30px 100px 100px 70px 70px 60px;
+            align-items: center;
+            gap: 15px;
+            padding: 12px 15px;
+            background: #16213e;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            transition: background 0.2s;
+        }
+        .sample-row:hover { background: #1a3a5c; }
+        .sample-checkbox { width: 18px; height: 18px; cursor: pointer; }
+        .sample-label {
+            padding: 4px 10px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: bold;
+            text-align: center;
+        }
+        .sample-label.beep { background: #00ff88; color: #000; }
+        .sample-label.not-beep { background: #ff6b6b; color: #000; }
+        .sample-label.pending { background: #666; color: #fff; }
+        .sample-date { color: #888; font-size: 0.85em; }
+        .sample-confidence { color: #00d4ff; font-weight: bold; }
+        .sample-source { color: #888; font-size: 0.85em; }
+        .btn-view {
+            padding: 6px 12px;
+            border: none;
+            border-radius: 4px;
+            background: #0099cc;
+            color: #fff;
+            cursor: pointer;
+            font-size: 0.85em;
+        }
+        .btn-view:hover { background: #00b8e8; }
+
+        /* Sample list container */
+        .sample-list {
+            background: #0f0f23;
+            border-radius: 10px;
+            padding: 15px;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        /* Pagination */
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 5px;
+            margin-top: 20px;
+        }
+        .pagination button {
+            padding: 8px 14px;
+            border: none;
+            border-radius: 6px;
+            background: #16213e;
+            color: #fff;
+            cursor: pointer;
+        }
+        .pagination button:hover { background: #1a3a5c; }
+        .pagination button.active { background: #00d4ff; color: #000; }
+        .pagination button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Loading states */
+        .loading {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 40px;
+            color: #888;
+        }
+        .loading::after {
+            content: '';
+            width: 24px;
+            height: 24px;
+            border: 3px solid #333;
+            border-top-color: #00d4ff;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-left: 10px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .btn-loading {
+            position: relative;
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        .btn-loading::after {
+            content: '';
+            position: absolute;
+            width: 16px;
+            height: 16px;
+            border: 2px solid transparent;
+            border-top-color: currentColor;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .sample-row {
+                grid-template-columns: 30px 1fr 60px;
+                gap: 10px;
+            }
+            .sample-row .sample-date,
+            .sample-row .sample-source { display: none; }
+            .training-stats {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .filter-bar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .batch-actions {
+                flex-wrap: wrap;
+            }
+            .main-nav {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .nav-tabs {
+                justify-content: center;
+            }
+        }
+
+        /* Sample detail modal */
+        .modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+        .modal-content {
+            background: #16213e;
+            padding: 30px;
+            border-radius: 15px;
+            max-width: 700px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .modal-close {
+            font-size: 1.5em;
+            cursor: pointer;
+            color: #888;
+        }
+        .modal-close:hover { color: #fff; }
+        .waveform-container {
+            position: relative;
+            background: #0a0a1a;
+            border-radius: 8px;
+            padding: 10px;
+            margin-bottom: 15px;
+        }
+        .waveform-container canvas { width: 100%; height: 120px; }
+        .detection-marker {
+            position: absolute;
+            top: 10px;
+            bottom: 10px;
+            width: 2px;
+            background: #ff6b6b;
+        }
+        .playback-controls {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .playback-controls input[type="range"] { flex: 1; }
+        .label-buttons {
+            display: flex;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .label-buttons button {
+            flex: 1;
+            padding: 15px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .notes-field textarea {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #333;
+            border-radius: 8px;
+            background: #0a0a1a;
+            color: #fff;
+            resize: vertical;
+            min-height: 80px;
+        }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🔊 Beep Detector - Training Dashboard</h1>
+        <!-- Navigation Bar -->
+        <nav class="main-nav">
+            <div class="nav-brand">🔊 Beep Detector</div>
+            <div class="nav-tabs">
+                <button class="nav-btn active" data-page="monitor" onclick="showPage('monitor')">
+                    📊 Monitor
+                </button>
+                <button class="nav-btn" data-page="training" onclick="showPage('training')">
+                    🧠 Training
+                </button>
+                <button class="nav-btn" data-page="dataset" onclick="showPage('dataset')">
+                    📁 Dataset
+                </button>
+            </div>
+            <div class="nav-status">
+                <div class="status-dot" id="nav-status-dot"></div>
+                <span id="nav-status-text">Connecting...</span>
+            </div>
+        </nav>
+
+        <!-- Page: Monitor & Analytics -->
+        <div id="page-monitor" class="page-content active">
 
         <div class="stats-grid">
             <div class="stat-card">
@@ -1131,7 +1833,7 @@ DASHBOARD_HTML = '''
         </div>
 
         <div class="dataset-section">
-            <h2>📚 Training Dataset (Used for Retraining)</h2>
+            <h2>📚 Quick Dataset View</h2>
             <div class="dataset-summary">
                 <div class="dataset-stat positive">
                     <span class="count" id="dataset-positive">0</span>
@@ -1146,14 +1848,208 @@ DASHBOARD_HTML = '''
                     <span class="label">Total Samples</span>
                 </div>
             </div>
-            <div class="dataset-tabs">
-                <button class="tab-btn active" onclick="showDatasetTab('all')">All</button>
-                <button class="tab-btn" onclick="showDatasetTab('positive')">Beep Only</button>
-                <button class="tab-btn" onclick="showDatasetTab('negative')">Not Beep Only</button>
-            </div>
-            <div id="dataset-list" class="dataset-list"></div>
+            <p style="color: #888; margin-top: 10px;">Go to <a href="#" onclick="showPage('dataset'); return false;" style="color: #00d4ff;">Dataset</a> tab for full management.</p>
         </div>
-    </div>
+
+        </div><!-- End page-monitor -->
+
+        <!-- Page: Training -->
+        <div id="page-training" class="page-content">
+            <h2 style="color: #00d4ff; margin-bottom: 20px;">🧠 Model Training</h2>
+
+            <!-- Capture Settings -->
+            <div class="settings-panel">
+                <h3 style="margin-bottom: 15px;">⚙️ Auto-Capture Settings</h3>
+                <div class="settings-row">
+                    <label>Auto-capture enabled:</label>
+                    <input type="checkbox" id="auto-capture-enabled" checked onchange="updateSettings()">
+                    <span style="color: #888;">Automatically save detected audio for labeling</span>
+                </div>
+                <div class="settings-row">
+                    <label>Capture duration:</label>
+                    <select id="capture-duration" onchange="updateSettings()" style="padding: 8px; background: #2a2a4e; color: #fff; border: 1px solid #444; border-radius: 4px;">
+                        <option value="3">3 seconds</option>
+                        <option value="5" selected>5 seconds</option>
+                        <option value="7">7 seconds</option>
+                        <option value="10">10 seconds</option>
+                    </select>
+                </div>
+                <div class="settings-row">
+                    <label>Confidence range:</label>
+                    <input type="range" id="conf-min" min="0" max="1" step="0.05" value="0" oninput="updateConfDisplay('min')">
+                    <span id="conf-min-val">0.00</span>
+                    <span style="margin: 0 10px;">to</span>
+                    <input type="range" id="conf-max" min="0" max="1" step="0.05" value="1" oninput="updateConfDisplay('max')">
+                    <span id="conf-max-val">1.00</span>
+                    <button onclick="updateSettings()" style="margin-left: 15px; padding: 6px 12px; background: #00d4ff; color: #000; border: none; border-radius: 4px; cursor: pointer;">Save</button>
+                </div>
+                <p style="color: #666; font-size: 0.85em; margin-top: 10px;">
+                    Only captures detections with confidence between min and max values. Use lower range (0.5-0.85) to focus on borderline cases.
+                </p>
+            </div>
+
+            <!-- Dataset Summary -->
+            <div class="training-stats">
+                <div class="training-card positive">
+                    <div class="big-number" id="summary-beep-count">0</div>
+                    <div style="color: #888;">Beep Samples</div>
+                </div>
+                <div class="training-card negative">
+                    <div class="big-number" id="summary-not-beep-count">0</div>
+                    <div style="color: #888;">Not Beep Samples</div>
+                </div>
+                <div class="training-card">
+                    <div class="big-number" id="summary-pending-count">0</div>
+                    <div style="color: #888;">Pending Review</div>
+                </div>
+                <div class="training-card">
+                    <div class="big-number" id="summary-total-count">0</div>
+                    <div style="color: #888;">Total Labeled</div>
+                </div>
+            </div>
+
+            <!-- Training Controls -->
+            <div class="settings-panel training-controls">
+                <h3 style="margin-bottom: 15px;">🚀 Train Model</h3>
+                <div style="display: flex; gap: 20px; align-items: center; flex-wrap: wrap; margin-bottom: 15px;">
+                    <div>
+                        <label style="color: #888; font-size: 0.9em;">Epochs:</label>
+                        <select id="training-epochs" style="padding: 8px; background: #2a2a4e; color: #fff; border: 1px solid #444; border-radius: 4px; margin-left: 5px;">
+                            <option value="10">10</option>
+                            <option value="20" selected>20</option>
+                            <option value="30">30</option>
+                            <option value="50">50</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="color: #888; font-size: 0.9em;">Learning Rate:</label>
+                        <select id="learning-rate" style="padding: 8px; background: #2a2a4e; color: #fff; border: 1px solid #444; border-radius: 4px; margin-left: 5px;">
+                            <option value="0.0001">0.0001</option>
+                            <option value="0.001" selected>0.001</option>
+                            <option value="0.01">0.01</option>
+                        </select>
+                    </div>
+                </div>
+                <button class="btn-primary" onclick="startTrainingFromPage()" style="padding: 15px 30px; font-size: 1.1em; background: linear-gradient(135deg, #00d4ff, #00ff88); color: #000; border: none; border-radius: 8px; cursor: pointer; font-weight: bold;">
+                    🧠 Retrain Model Now
+                </button>
+                <p style="color: #666; margin-top: 10px; font-size: 0.9em;">
+                    Uses all labeled samples to fine-tune the neural network model.
+                </p>
+            </div>
+
+            <!-- Training History -->
+            <div class="settings-panel">
+                <h3 style="margin-bottom: 15px;">📜 Training History</h3>
+                <div id="training-history-container">
+                    <table class="training-history-table">
+                        <thead>
+                            <tr>
+                                <th>Date</th>
+                                <th>Samples</th>
+                                <th>Beeps</th>
+                                <th>Not Beeps</th>
+                                <th>Epochs</th>
+                                <th>Accuracy</th>
+                            </tr>
+                        </thead>
+                        <tbody id="training-history-body">
+                            <tr><td colspan="6" style="color: #666; text-align: center;">No training runs yet</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div><!-- End page-training -->
+
+        <!-- Page: Dataset Management -->
+        <div id="page-dataset" class="page-content">
+            <h2 style="color: #00d4ff; margin-bottom: 20px;">📁 Dataset Management</h2>
+
+            <!-- Filter Bar -->
+            <div class="filter-bar">
+                <select id="filter-type">
+                    <option value="all">All Types</option>
+                    <option value="beep">Beep Only</option>
+                    <option value="not_beep">Not Beep Only</option>
+                    <option value="pending">Pending Review</option>
+                </select>
+                <select id="filter-source">
+                    <option value="all">All Sources</option>
+                    <option value="auto">Auto-Detected</option>
+                    <option value="manual">Manual Capture</option>
+                </select>
+                <div style="display: flex; align-items: center; gap: 5px;">
+                    <span style="color: #888;">Confidence:</span>
+                    <input type="number" id="filter-conf-min" min="0" max="100" value="0" style="width: 60px;">
+                    <span>-</span>
+                    <input type="number" id="filter-conf-max" min="0" max="100" value="100" style="width: 60px;">
+                    <span style="color: #888;">%</span>
+                </div>
+                <button class="btn-filter" onclick="applyFilters()">Apply</button>
+                <button class="btn-reset" onclick="resetFilters()">Reset</button>
+            </div>
+
+            <!-- Batch Actions -->
+            <div class="batch-actions">
+                <span class="selection-count"><span id="selected-count">0</span> selected</span>
+                <button class="btn-correct" onclick="batchLabel(true)" style="padding: 8px 16px;">✓ Label as Beep</button>
+                <button class="btn-incorrect" onclick="batchLabel(false)" style="padding: 8px 16px;">✗ Label as Not Beep</button>
+                <button class="btn-delete" onclick="batchDelete()">🗑️ Delete Selected</button>
+                <button id="select-all-btn" style="background: #444; color: #fff; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer;" onclick="selectAllSamples()">Select All</button>
+                <button id="select-none-btn" style="background: #333; color: #888; padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer;" onclick="selectNoneSamples()">Clear</button>
+            </div>
+
+            <!-- Sample List -->
+            <div id="dataset-sample-list" class="sample-list"></div>
+
+            <!-- Pagination -->
+            <div class="pagination">
+                <button id="prev-page" onclick="prevPage()" style="padding: 8px 16px; background: #2a2a4e; color: #fff; border: 1px solid #444; border-radius: 6px; cursor: pointer;">← Prev</button>
+                <span id="page-info" style="color: #888; margin: 0 15px;">Page 1 of 1</span>
+                <button id="next-page" onclick="nextPage()" style="padding: 8px 16px; background: #2a2a4e; color: #fff; border: 1px solid #444; border-radius: 6px; cursor: pointer;">Next →</button>
+            </div>
+        </div><!-- End page-dataset -->
+
+        <!-- Sample Detail Modal -->
+        <div id="sample-modal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Sample: <span id="modal-sample-id"></span></h3>
+                    <span class="modal-close" onclick="closeSampleModal()">&times;</span>
+                </div>
+
+                <div class="waveform-container">
+                    <canvas id="waveform-canvas" width="640" height="120"></canvas>
+                </div>
+
+                <div class="playback-controls">
+                    <button onclick="playModalAudio()" style="padding: 8px 16px; background: #00d4ff; color: #000; border: none; border-radius: 6px; cursor: pointer;">▶ Play</button>
+                    <button onclick="pauseModalAudio()" style="padding: 8px 16px; background: #444; color: #fff; border: none; border-radius: 6px; cursor: pointer;">⏸ Pause</button>
+                </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px; color: #888;">
+                    <div><strong>Timestamp:</strong> <span id="modal-timestamp"></span></div>
+                    <div><strong>Confidence:</strong> <span id="modal-confidence"></span></div>
+                    <div><strong>Source:</strong> <span id="modal-source"></span></div>
+                    <div><strong>Status:</strong> <span id="modal-label-status"></span></div>
+                </div>
+
+                <div class="label-buttons" style="margin-bottom: 20px;">
+                    <button class="btn-correct" onclick="labelFromModal(true)" style="padding: 12px 24px;">✓ Label as Beep</button>
+                    <button class="btn-incorrect" onclick="labelFromModal(false)" style="padding: 12px 24px;">✗ Label as Not Beep</button>
+                </div>
+
+                <div class="notes-field">
+                    <label style="color: #888; display: block; margin-bottom: 5px;">Notes:</label>
+                    <textarea id="modal-notes" placeholder="Add notes about this sample..."></textarea>
+                    <button onclick="saveModalNotes()" style="margin-top: 10px; padding: 8px 16px; background: #00d4ff; color: #000; border: none; border-radius: 6px; cursor: pointer;">Save Notes</button>
+                </div>
+
+                <button onclick="deleteFromModal()" style="margin-top: 15px; padding: 10px 20px; background: #8b0000; color: #fff; border: none; border-radius: 6px; cursor: pointer; width: 100%;">🗑️ Delete Sample</button>
+            </div>
+        </div>
+
+    </div><!-- End container -->
 
     <script>
         let trainingMode = false;
@@ -1565,9 +2461,618 @@ DASHBOARD_HTML = '''
                 });
         }
 
+        // ========================================
+        // Multi-Page Navigation
+        // ========================================
+        let currentPage = 'monitor';
+
+        function showPage(pageName) {
+            currentPage = pageName;
+
+            // Hide all pages
+            document.querySelectorAll('.page-content').forEach(page => {
+                page.classList.remove('active');
+            });
+
+            // Show selected page
+            const targetPage = document.getElementById('page-' + pageName);
+            if (targetPage) {
+                targetPage.classList.add('active');
+            }
+
+            // Update nav tabs
+            document.querySelectorAll('.nav-btn').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelector(`.nav-btn[onclick*="${pageName}"]`).classList.add('active');
+
+            // Load page-specific data
+            if (pageName === 'training') {
+                loadSettings();
+                fetchTrainingHistory();
+                updateDatasetSummary();
+            } else if (pageName === 'dataset') {
+                loadDatasetSamples();
+            }
+        }
+
+        // ========================================
+        // Settings Management
+        // ========================================
+        function loadSettings() {
+            fetch('/api/settings')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('auto-capture-enabled').checked = data.auto_capture_enabled !== false;
+                    document.getElementById('capture-duration').value = data.capture_duration_seconds || 5;
+                    document.getElementById('conf-min').value = data.capture_confidence_min || 0;
+                    document.getElementById('conf-max').value = data.capture_confidence_max || 1;
+
+                    // Update display values
+                    document.getElementById('conf-min-val').textContent = (data.capture_confidence_min || 0).toFixed(2);
+                    document.getElementById('conf-max-val').textContent = (data.capture_confidence_max || 1).toFixed(2);
+                })
+                .catch(err => {
+                    console.error('Failed to load settings:', err);
+                    showToast('Failed to load settings', 'error');
+                });
+        }
+
+        function updateSettings() {
+            const settings = {
+                auto_capture_enabled: document.getElementById('auto-capture-enabled').checked,
+                capture_duration_seconds: parseInt(document.getElementById('capture-duration').value),
+                capture_confidence_min: parseFloat(document.getElementById('conf-min').value),
+                capture_confidence_max: parseFloat(document.getElementById('conf-max').value)
+            };
+
+            fetch('/api/settings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(settings)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('Settings saved!', 'success');
+                } else {
+                    showToast('Failed to save settings', 'error');
+                }
+            });
+        }
+
+        function updateConfDisplay(type) {
+            const slider = document.getElementById('conf-' + type);
+            document.getElementById('conf-' + type + '-val').textContent = parseFloat(slider.value).toFixed(2);
+        }
+
+        // ========================================
+        // Training Page Functions
+        // ========================================
+        function updateDatasetSummary() {
+            fetch('/api/dataset')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('summary-beep-count').textContent = data.stats.positive;
+                    document.getElementById('summary-not-beep-count').textContent = data.stats.negative;
+                    document.getElementById('summary-total-count').textContent = data.stats.total;
+
+                    // Calculate unlabeled from events
+                    fetch('/api/events')
+                        .then(r => r.json())
+                        .then(evtData => {
+                            document.getElementById('summary-pending-count').textContent = evtData.events.length;
+                        });
+                });
+        }
+
+        function fetchTrainingHistory() {
+            fetch('/api/training-history')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('training-history-body');
+
+                    if (!data.history || data.history.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#666;padding:20px;">No training runs yet</td></tr>';
+                        return;
+                    }
+
+                    tbody.innerHTML = data.history.map(run => {
+                        const date = new Date(run.timestamp).toLocaleString();
+                        const accuracy = (run.final_accuracy * 100).toFixed(1) + '%';
+                        return `
+                            <tr>
+                                <td>${date}</td>
+                                <td>${run.samples_used}</td>
+                                <td>${run.beeps}</td>
+                                <td>${run.not_beeps}</td>
+                                <td>${run.epochs}</td>
+                                <td style="color: ${run.final_accuracy > 0.9 ? '#00ff88' : '#ffaa00'}">${accuracy}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                })
+                .catch(err => {
+                    console.error('Failed to fetch training history:', err);
+                });
+        }
+
+        function startTrainingFromPage() {
+            const epochs = parseInt(document.getElementById('training-epochs').value);
+            const learningRate = parseFloat(document.getElementById('learning-rate').value);
+
+            const btn = document.querySelector('.training-controls .btn-primary');
+            const originalText = btn.textContent;
+            btn.textContent = '⏳ Training...';
+            btn.disabled = true;
+
+            fetch('/api/retrain', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({epochs: epochs, learning_rate: learningRate})
+            })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        btn.textContent = '✓ Complete!';
+                        btn.style.background = '#00ff88';
+                        showToast(`Model trained! Accuracy: ${(data.final_accuracy * 100).toFixed(1)}%`, 'success');
+                        fetchTrainingHistory();
+                        updateDatasetSummary();
+                    } else {
+                        btn.textContent = '❌ Failed';
+                        showToast('Training failed: ' + (data.error || 'Unknown error'), 'error');
+                    }
+                    setTimeout(() => {
+                        btn.textContent = originalText;
+                        btn.style.background = '';
+                        btn.disabled = false;
+                    }, 3000);
+                })
+                .catch(err => {
+                    btn.textContent = '❌ Error';
+                    showToast('Training error: ' + err, 'error');
+                    setTimeout(() => {
+                        btn.textContent = originalText;
+                        btn.disabled = false;
+                    }, 3000);
+                });
+        }
+
+        // ========================================
+        // Dataset Management Page Functions
+        // ========================================
+        let datasetPage = 1;
+        let datasetTotalPages = 1;
+        let datasetItems = [];
+        let selectedSamples = new Set();
+
+        function loadDatasetSamples() {
+            const typeFilter = document.getElementById('filter-type').value;
+            const sourceFilter = document.getElementById('filter-source').value;
+            const confMin = parseFloat(document.getElementById('filter-conf-min').value) / 100;
+            const confMax = parseFloat(document.getElementById('filter-conf-max').value) / 100;
+
+            let url = `/api/samples?page=${datasetPage}&per_page=20`;
+            if (typeFilter && typeFilter !== 'all') url += `&type=${typeFilter}`;
+            if (sourceFilter && sourceFilter !== 'all') url += `&source=${sourceFilter}`;
+            if (confMin > 0) url += `&conf_min=${confMin}`;
+            if (confMax < 1) url += `&conf_max=${confMax}`;
+
+            // Show loading state
+            const container = document.getElementById('dataset-sample-list');
+            container.innerHTML = '<div class="loading">Loading samples</div>';
+
+            fetch(url)
+                .then(r => r.json())
+                .then(data => {
+                    datasetItems = data.samples || [];
+                    datasetTotalPages = data.total_pages || 1;
+                    selectedSamples.clear();
+                    renderDatasetPage();
+                    updatePagination();
+                    updateBatchButtons();
+                })
+                .catch(err => {
+                    container.innerHTML = '<div style="text-align:center;color:#ff6b6b;padding:40px;">Failed to load samples. Please try again.</div>';
+                    showToast('Failed to load samples: ' + err, 'error');
+                });
+        }
+
+        function renderDatasetPage() {
+            const container = document.getElementById('dataset-sample-list');
+
+            if (datasetItems.length === 0) {
+                container.innerHTML = '<div style="text-align:center;color:#666;padding:40px;">No samples match your filters</div>';
+                return;
+            }
+
+            container.innerHTML = datasetItems.map(s => {
+                const labelText = s.label === null ? '⏳ Pending' : (s.label ? '✓ Beep' : '✗ Not Beep');
+                const labelClass = s.label === null ? 'pending' : (s.label ? 'beep' : 'not-beep');
+                const sourceText = s.source_type === 'manual_capture' ? 'Manual' : 'Auto';
+                const date = new Date(s.timestamp).toLocaleDateString();
+                const checked = selectedSamples.has(s.id) ? 'checked' : '';
+
+                return `
+                    <div class="sample-row" data-id="${s.id}">
+                        <input type="checkbox" class="sample-checkbox" ${checked} onchange="toggleSampleSelection('${s.id}')">
+                        <span class="sample-label ${labelClass}">${labelText}</span>
+                        <span class="sample-date">${date}</span>
+                        <span class="sample-confidence">${(s.confidence * 100).toFixed(0)}%</span>
+                        <span class="sample-source">${sourceText}</span>
+                        <button class="btn-view" onclick="openSampleModal('${s.id}')">View</button>
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function updatePagination() {
+            document.getElementById('page-info').textContent = `Page ${datasetPage} of ${datasetTotalPages}`;
+            document.getElementById('prev-page').disabled = datasetPage <= 1;
+            document.getElementById('next-page').disabled = datasetPage >= datasetTotalPages;
+        }
+
+        function prevPage() {
+            if (datasetPage > 1) {
+                datasetPage--;
+                loadDatasetSamples();
+            }
+        }
+
+        function nextPage() {
+            if (datasetPage < datasetTotalPages) {
+                datasetPage++;
+                loadDatasetSamples();
+            }
+        }
+
+        function applyFilters() {
+            datasetPage = 1;
+            loadDatasetSamples();
+        }
+
+        function resetFilters() {
+            document.getElementById('filter-type').value = '';
+            document.getElementById('filter-source').value = '';
+            document.getElementById('filter-conf-min').value = '';
+            document.getElementById('filter-conf-max').value = '';
+            datasetPage = 1;
+            loadDatasetSamples();
+        }
+
+        function toggleSampleSelection(id) {
+            if (selectedSamples.has(id)) {
+                selectedSamples.delete(id);
+            } else {
+                selectedSamples.add(id);
+            }
+            updateBatchButtons();
+        }
+
+        function selectAllSamples() {
+            datasetItems.forEach(s => selectedSamples.add(s.id));
+            renderDatasetPage();
+            updateBatchButtons();
+        }
+
+        function selectNoneSamples() {
+            selectedSamples.clear();
+            renderDatasetPage();
+            updateBatchButtons();
+        }
+
+        function updateBatchButtons() {
+            const count = selectedSamples.size;
+            document.getElementById('selected-count').textContent = count;
+            document.querySelectorAll('.batch-actions button').forEach(btn => {
+                if (btn.id !== 'select-all-btn' && btn.id !== 'select-none-btn') {
+                    btn.disabled = count === 0;
+                }
+            });
+        }
+
+        function batchLabel(isBeep) {
+            if (selectedSamples.size === 0) return;
+
+            const label = isBeep ? 'beep' : 'not-beep';
+            if (!confirm(`Label ${selectedSamples.size} samples as "${label}"?`)) return;
+
+            fetch('/api/samples/batch-label', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ids: Array.from(selectedSamples), label: isBeep})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast(`Labeled ${data.updated} samples`, 'success');
+                    loadDatasetSamples();
+                    fetchEvents();
+                } else {
+                    showToast('Batch label failed: ' + data.error, 'error');
+                }
+            });
+        }
+
+        function batchDelete() {
+            if (selectedSamples.size === 0) return;
+
+            if (!confirm(`Delete ${selectedSamples.size} samples? This cannot be undone.`)) return;
+
+            fetch('/api/samples/batch-delete', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ids: Array.from(selectedSamples)})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast(`Deleted ${data.deleted} samples`, 'success');
+                    loadDatasetSamples();
+                    fetchEvents();
+                } else {
+                    showToast('Batch delete failed: ' + data.error, 'error');
+                }
+            });
+        }
+
+        // ========================================
+        // Sample Detail Modal
+        // ========================================
+        let currentModalSample = null;
+        let modalAudio = null;
+
+        function openSampleModal(id) {
+            currentModalSample = id;
+            const modal = document.getElementById('sample-modal');
+            modal.style.display = 'flex';
+
+            // Load sample details
+            const sample = datasetItems.find(s => s.id === id) || {};
+
+            document.getElementById('modal-sample-id').textContent = id;
+            document.getElementById('modal-timestamp').textContent = new Date(sample.timestamp).toLocaleString();
+            document.getElementById('modal-confidence').textContent = (sample.confidence * 100).toFixed(1) + '%';
+            document.getElementById('modal-source').textContent = sample.source_type === 'manual_capture' ? 'Manual Capture' : 'Auto Detection';
+            document.getElementById('modal-notes').value = sample.notes || '';
+
+            // Update label buttons state
+            const labelStatus = document.getElementById('modal-label-status');
+            if (sample.label === null) {
+                labelStatus.textContent = 'Pending';
+                labelStatus.style.color = '#888';
+            } else if (sample.label) {
+                labelStatus.textContent = 'Labeled: Beep';
+                labelStatus.style.color = '#00ff88';
+            } else {
+                labelStatus.textContent = 'Labeled: Not Beep';
+                labelStatus.style.color = '#ff6b6b';
+            }
+
+            // Load waveform
+            loadWaveform(id, sample.detection_offset_ms, sample.duration_ms || 5000);
+
+            // Setup audio
+            modalAudio = new Audio(`/api/audio/${id}`);
+        }
+
+        function closeSampleModal() {
+            document.getElementById('sample-modal').style.display = 'none';
+            currentModalSample = null;
+            if (modalAudio) {
+                modalAudio.pause();
+                modalAudio = null;
+            }
+        }
+
+        function loadWaveform(id, detectionOffsetMs, durationMs) {
+            fetch(`/api/samples/${id}/waveform`)
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        drawWaveform(data.waveform, detectionOffsetMs, durationMs);
+                    }
+                });
+        }
+
+        function drawWaveform(waveformData, detectionOffsetMs, durationMs) {
+            const canvas = document.getElementById('waveform-canvas');
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+
+            // Clear
+            ctx.fillStyle = '#1a1a2e';
+            ctx.fillRect(0, 0, width, height);
+
+            if (!waveformData || waveformData.length === 0) return;
+
+            // Draw waveform
+            ctx.strokeStyle = '#4ecdc4';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+
+            const maxVal = Math.max(...waveformData.map(Math.abs)) || 1;
+            waveformData.forEach((val, i) => {
+                const x = (i / waveformData.length) * width;
+                const y = height/2 - (val / maxVal * height * 0.4);
+                i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+
+            // Draw detection marker
+            if (detectionOffsetMs && durationMs) {
+                const markerX = (detectionOffsetMs / durationMs) * width;
+                ctx.strokeStyle = '#ff6b6b';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(markerX, 0);
+                ctx.lineTo(markerX, height);
+                ctx.stroke();
+
+                // Label
+                ctx.fillStyle = '#ff6b6b';
+                ctx.font = '10px monospace';
+                ctx.fillText('Detection', markerX + 5, 15);
+            }
+
+            // Time axis labels
+            ctx.fillStyle = '#666';
+            ctx.font = '10px monospace';
+            const duration = durationMs / 1000;
+            for (let t = 0; t <= duration; t++) {
+                const x = (t / duration) * width;
+                ctx.fillText(t + 's', x, height - 5);
+            }
+        }
+
+        function playModalAudio() {
+            if (modalAudio) {
+                modalAudio.currentTime = 0;
+                modalAudio.play();
+            }
+        }
+
+        function pauseModalAudio() {
+            if (modalAudio) {
+                modalAudio.pause();
+            }
+        }
+
+        function labelFromModal(isBeep) {
+            if (!currentModalSample) return;
+
+            fetch(`/api/samples/${currentModalSample}`, {
+                method: 'PATCH',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({label: isBeep})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('Sample labeled!', 'success');
+
+                    // Update modal display
+                    const labelStatus = document.getElementById('modal-label-status');
+                    if (isBeep) {
+                        labelStatus.textContent = 'Labeled: Beep';
+                        labelStatus.style.color = '#00ff88';
+                    } else {
+                        labelStatus.textContent = 'Labeled: Not Beep';
+                        labelStatus.style.color = '#ff6b6b';
+                    }
+
+                    // Refresh lists
+                    loadDatasetSamples();
+                    fetchEvents();
+                } else {
+                    showToast('Failed to label: ' + data.error, 'error');
+                }
+            });
+        }
+
+        function saveModalNotes() {
+            if (!currentModalSample) return;
+
+            const notes = document.getElementById('modal-notes').value;
+
+            fetch(`/api/samples/${currentModalSample}`, {
+                method: 'PATCH',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({notes: notes})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    showToast('Notes saved!', 'success');
+                } else {
+                    showToast('Failed to save notes: ' + data.error, 'error');
+                }
+            });
+        }
+
+        function deleteFromModal() {
+            if (!currentModalSample) return;
+
+            if (!confirm('Delete this sample? This cannot be undone.')) return;
+
+            fetch('/api/dataset/' + currentModalSample, { method: 'DELETE' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        showToast('Sample deleted', 'success');
+                        closeSampleModal();
+                        loadDatasetSamples();
+                        fetchEvents();
+                    } else {
+                        showToast('Failed to delete: ' + data.error, 'error');
+                    }
+                });
+        }
+
+        // Close modal on outside click
+        document.getElementById('sample-modal').addEventListener('click', function(e) {
+            if (e.target === this) {
+                closeSampleModal();
+            }
+        });
+
+        // ========================================
+        // Toast Notifications
+        // ========================================
+        function showToast(message, type = 'info') {
+            // Create toast element
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            toast.textContent = message;
+            toast.style.cssText = `
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                padding: 12px 24px;
+                border-radius: 8px;
+                color: white;
+                font-size: 14px;
+                z-index: 10000;
+                animation: slideIn 0.3s ease;
+                background: ${type === 'success' ? '#00ff88' : type === 'error' ? '#ff6b6b' : '#00d4ff'};
+                color: ${type === 'success' ? '#000' : type === 'error' ? '#fff' : '#000'};
+            `;
+
+            document.body.appendChild(toast);
+
+            // Remove after 3 seconds
+            setTimeout(() => {
+                toast.style.animation = 'slideOut 0.3s ease';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        // Add animation styles
+        const toastStyle = document.createElement('style');
+        toastStyle.textContent = `
+            @keyframes slideIn {
+                from { transform: translateX(100%); opacity: 0; }
+                to { transform: translateX(0); opacity: 1; }
+            }
+            @keyframes slideOut {
+                from { transform: translateX(0); opacity: 1; }
+                to { transform: translateX(100%); opacity: 0; }
+            }
+        `;
+        document.head.appendChild(toastStyle);
+
+        // ========================================
+        // Initialization
+        // ========================================
         // Fetch dataset on load and periodically
         fetchDataset();
         setInterval(fetchDataset, 5000);
+
+        // Initialize settings slider displays
+        document.getElementById('conf-min')?.addEventListener('input', () => updateConfDisplay('min'));
+        document.getElementById('conf-max')?.addEventListener('input', () => updateConfDisplay('max'));
     </script>
 </body>
 </html>
@@ -1724,31 +3229,37 @@ class AudioStreamServer:
         @self.flask_app.route('/api/mark-beep', methods=['POST'])
         def api_mark_beep():
             """Manually mark current audio as containing a beep (for false negatives)."""
-            if len(self.continuous_buffer) < self.sample_rate * 2:
+            # Capture 5 seconds like auto-detection
+            capture_duration = self.labeling_store.settings.get('capture_duration_seconds', 5)
+            samples_needed = self.sample_rate * capture_duration
+
+            if len(self.continuous_buffer) < samples_needed:
                 return jsonify({
                     "success": False,
-                    "error": "Not enough audio buffered yet"
+                    "error": f"Not enough audio buffered yet (need {capture_duration}s)"
                 })
 
-            # Capture 2 seconds of audio ending now
+            # Capture audio ending now
             audio_samples = np.array(
-                list(self.continuous_buffer)[-self.sample_rate * 2:],
+                list(self.continuous_buffer)[-samples_needed:],
                 dtype=np.int16
             )
 
             # Create event with confidence=0 to indicate manual capture
-            # Pre-label as True (beep) since user is marking it as a beep
+            # For manual captures, the "beep" is assumed to be at the end
             event = self.labeling_store.add_event(
                 confidence=0.0,  # 0 confidence = manual capture (model missed it)
                 audio_samples=audio_samples,
                 sample_rate=self.sample_rate,
+                source_type="manual_capture",
+                detection_offset_ms=int((capture_duration * 1000) - 500),  # Beep at end
             )
 
             # Auto-label as true positive since user clicked "Mark Beep Now"
             self.labeling_store.label_event(event.id, is_beep=True)
 
             print(f"\n*** MANUAL BEEP MARKED by user ***")
-            print(f"    Saved: {event.id}")
+            print(f"    Saved {capture_duration}s audio: {event.id}")
             print(f"    This was a FALSE NEGATIVE - model missed this beep\n")
 
             return jsonify({
@@ -1866,6 +3377,93 @@ class AudioStreamServer:
             print(f"[DATASET] Removed sample {sample_id} from training dataset")
 
             return jsonify({"success": True})
+
+        # ============================================
+        # New API Endpoints for Enhanced Dashboard
+        # ============================================
+
+        @self.flask_app.route('/api/samples')
+        def api_samples():
+            """Get filtered and paginated samples."""
+            sample_type = request.args.get('type', 'all')
+            source = request.args.get('source', 'all')
+            conf_min = float(request.args.get('conf_min', 0.0))
+            conf_max = float(request.args.get('conf_max', 1.0))
+            page = int(request.args.get('page', 1))
+            per_page = int(request.args.get('per_page', 20))
+
+            result = self.labeling_store.get_samples(
+                sample_type=sample_type,
+                source=source,
+                conf_min=conf_min,
+                conf_max=conf_max,
+                page=page,
+                per_page=per_page,
+            )
+            return jsonify(result)
+
+        @self.flask_app.route('/api/samples/<sample_id>/waveform')
+        def api_sample_waveform(sample_id):
+            """Get waveform data for visualization."""
+            num_points = int(request.args.get('points', 500))
+            result = self.labeling_store.get_waveform(sample_id, num_points)
+            if result is None:
+                return jsonify({"error": "Sample not found"}), 404
+            return jsonify(result)
+
+        @self.flask_app.route('/api/samples/<sample_id>', methods=['PATCH'])
+        def api_update_sample(sample_id):
+            """Update a sample's label or notes."""
+            data = request.get_json()
+            label = data.get('label')  # Can be True, False, or None
+            notes = data.get('notes')
+
+            success = self.labeling_store.update_sample(sample_id, label=label, notes=notes)
+            if not success:
+                return jsonify({"success": False, "error": "Sample not found"}), 404
+            return jsonify({"success": True})
+
+        @self.flask_app.route('/api/samples/batch-label', methods=['POST'])
+        def api_batch_label():
+            """Batch label multiple samples."""
+            data = request.get_json()
+            sample_ids = data.get('ids', [])
+            label = data.get('label')
+
+            if label is None:
+                return jsonify({"success": False, "error": "Label required"}), 400
+
+            count = self.labeling_store.batch_label(sample_ids, label)
+            return jsonify({"success": True, "updated": count})
+
+        @self.flask_app.route('/api/samples/batch-delete', methods=['POST'])
+        def api_batch_delete():
+            """Batch delete multiple samples."""
+            data = request.get_json()
+            sample_ids = data.get('ids', [])
+
+            count = self.labeling_store.batch_delete(sample_ids)
+            return jsonify({"success": True, "deleted": count})
+
+        @self.flask_app.route('/api/training-history')
+        def api_training_history():
+            """Get training run history."""
+            return jsonify({
+                "history": self.labeling_store.training_history,
+                "total_runs": len(self.labeling_store.training_history),
+            })
+
+        @self.flask_app.route('/api/settings')
+        def api_get_settings():
+            """Get current capture settings."""
+            return jsonify(self.labeling_store.settings)
+
+        @self.flask_app.route('/api/settings', methods=['POST'])
+        def api_update_settings():
+            """Update capture settings."""
+            data = request.get_json()
+            updated = self.labeling_store.update_settings(data)
+            return jsonify({"success": True, "settings": updated})
 
     def _send_detection_to_esp32(self, detected: bool, confidence: float):
         """Send detection result back to ESP32 via UDP."""
@@ -1988,20 +3586,35 @@ class AudioStreamServer:
                     print(f"\n*** BEEP DETECTED! confidence={confidence:.3f} ***")
                     print(f"    Sent to ESP32 at {self.esp32_addr[0]}:{self.response_port}")
 
-                    # Save detection for labeling ONLY if training mode is ON
-                    if self.training_mode and len(self.continuous_buffer) >= self.sample_rate * 2:
+                    # Save detection for labeling based on configurable settings
+                    # Capture 5 seconds of audio ending at detection moment
+                    capture_duration = self.labeling_store.settings.get('capture_duration_seconds', 5)
+                    samples_needed = self.sample_rate * capture_duration
+
+                    if self.labeling_store.should_capture(confidence) and len(self.continuous_buffer) >= samples_needed:
                         audio_samples = np.array(
-                            list(self.continuous_buffer)[-self.sample_rate * 2:],
+                            list(self.continuous_buffer)[-samples_needed:],
                             dtype=np.int16
                         )
+                        # Detection occurs at end of clip (minus detection window ~500ms)
+                        detection_offset_ms = int((capture_duration * 1000) - 500)
                         event = self.labeling_store.add_event(
                             confidence=confidence,
                             audio_samples=audio_samples,
                             sample_rate=self.sample_rate,
+                            source_type="auto_detection",
+                            detection_offset_ms=detection_offset_ms,
                         )
-                        print(f"    Saved for labeling: {event.id}\n")
-                    elif not self.training_mode:
-                        print(f"    (Training mode OFF - not saving for labeling)\n")
+                        print(f"    Saved {capture_duration}s audio for labeling: {event.id}")
+                        print(f"    (Detection at {detection_offset_ms}ms mark)\n")
+                    else:
+                        settings = self.labeling_store.settings
+                        if not settings.get('auto_capture_enabled', True):
+                            print(f"    (Auto-capture disabled)\n")
+                        else:
+                            conf_min = settings.get('capture_confidence_min', 0.0)
+                            conf_max = settings.get('capture_confidence_max', 1.0)
+                            print(f"    (Confidence {confidence:.2f} outside capture range [{conf_min:.2f}-{conf_max:.2f}])\n")
 
         if self.recording:
             self.record_buffer.append(samples)
