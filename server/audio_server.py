@@ -70,15 +70,10 @@ except ImportError:
     FLASK_AVAILABLE = False
     print("Warning: Flask not installed. Web dashboard disabled. Install with: pip install flask")
 
-# Ensemble Detector
+# Ensemble Detector - imported conditionally when needed to avoid AVX requirement
+# The import is deferred until use_ensemble=True to prevent TensorFlow from loading
+# on CPUs without AVX support (like Intel Celeron N3050)
 ENSEMBLE_AVAILABLE = False
-try:
-    from ensemble_detector import EnsembleBeepDetector
-    ENSEMBLE_AVAILABLE = True
-    print("[INFO] Ensemble detector available (YAMNet + Frequency + Energy)")
-except ImportError as e:
-    print(f"[WARNING] Ensemble detector not available: {e}")
-    print("[WARNING] Falling back to legacy NeuralBeepDetector")
 
 
 # ============================================
@@ -3140,6 +3135,9 @@ class UnifiedBeepDetector:
         if self.use_ensemble:
             print("\n[DETECTOR] Initializing Ensemble Detector (YAMNet + Frequency + Energy)")
             try:
+                # Import ensemble detector only when needed (avoids AVX requirement on legacy CPUs)
+                from ensemble_detector import EnsembleBeepDetector
+
                 self.detector = EnsembleBeepDetector(
                     yamnet_weight=ensemble_yamnet_weight,
                     frequency_weight=ensemble_frequency_weight,
