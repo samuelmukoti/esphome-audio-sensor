@@ -3144,6 +3144,14 @@ class UnifiedBeepDetector:
             )
             print(f"[DETECTOR] Legacy detector initialized")
 
+    @property
+    def confidence_threshold(self):
+        """Get confidence threshold from wrapped detector."""
+        if self.use_ensemble:
+            return self.detector.threshold if self.detector else 0.0
+        else:
+            return self.detector.confidence_threshold if self.detector else 0.0
+
     def detect(self, samples: np.ndarray) -> dict:
         """
         Run detection on audio samples.
