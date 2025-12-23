@@ -1,15 +1,17 @@
 # Beep Detection Server
 # Runs neural network inference on audio streamed from ESP32
+# Now supports ensemble detector (YAMNet + Frequency + Energy)
 
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies for audio processing
+# Install system dependencies for audio processing and TensorFlow
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     curl \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
@@ -18,6 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY audio_server.py .
+COPY ensemble_detector.py .
 COPY models/ models/
 
 # Create directories for data persistence
@@ -35,13 +38,17 @@ EXPOSE 8080
 ENV AUDIO_PORT=5050
 ENV WEB_PORT=8080
 ENV CONFIDENCE_THRESHOLD=0.7
+ENV USE_ENSEMBLE=true
+ENV ENSEMBLE_THRESHOLD=0.35
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${WEB_PORT}/api/status || exit 1
 
-# Run the server
+# Run the server with ensemble detector enabled by default
+# Use --no-ensemble flag to fall back to legacy detector
 CMD ["python", "-u", "audio_server.py", \
      "--port", "5050", \
      "--web-port", "8080", \
-     "--confidence-threshold", "0.7"]
+     "--use-ensemble", \
+     "--ensemble-threshold", "0.35"]

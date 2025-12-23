@@ -70,6 +70,16 @@ except ImportError:
     FLASK_AVAILABLE = False
     print("Warning: Flask not installed. Web dashboard disabled. Install with: pip install flask")
 
+# Ensemble Detector
+ENSEMBLE_AVAILABLE = False
+try:
+    from ensemble_detector import EnsembleBeepDetector
+    ENSEMBLE_AVAILABLE = True
+    print("[INFO] Ensemble detector available (YAMNet + Frequency + Energy)")
+except ImportError as e:
+    print(f"[WARNING] Ensemble detector not available: {e}")
+    print("[WARNING] Falling back to legacy NeuralBeepDetector")
+
 
 # ============================================
 # Detection Event Storage for Labeling
@@ -3080,6 +3090,173 @@ DASHBOARD_HTML = '''
 
 
 # ============================================
+# Unified Detector Wrapper
+# ============================================
+
+class UnifiedBeepDetector:
+    """
+    Unified wrapper that provides a consistent interface for both
+    EnsembleBeepDetector and legacy NeuralBeepDetector.
+
+    This allows seamless switching between detection methods via CLI flag.
+    """
+
+    def __init__(
+        self,
+        use_ensemble: bool = True,
+        ensemble_threshold: float = 0.35,
+        ensemble_yamnet_weight: float = 0.6,
+        ensemble_frequency_weight: float = 0.2,
+        ensemble_energy_weight: float = 0.2,
+        legacy_model_path: str = "models/beep_detector.keras",
+        legacy_confidence_threshold: float = 0.5,
+        sample_rate: int = 16000,
+        window_duration_ms: int = 500,
+    ):
+        """
+        Initialize unified detector.
+
+        Args:
+            use_ensemble: If True, use EnsembleBeepDetector; else use legacy NeuralBeepDetector
+            ensemble_threshold: Detection threshold for ensemble detector
+            ensemble_yamnet_weight: Weight for YAMNet component
+            ensemble_frequency_weight: Weight for frequency detector
+            ensemble_energy_weight: Weight for energy detector
+            legacy_model_path: Path to legacy TFLite/Keras model
+            legacy_confidence_threshold: Threshold for legacy detector
+            sample_rate: Audio sample rate in Hz
+            window_duration_ms: Detection window duration in milliseconds
+        """
+        self.sample_rate = sample_rate
+        self.window_duration_ms = window_duration_ms
+        self.use_ensemble = use_ensemble and ENSEMBLE_AVAILABLE
+        self.detector = None
+        self.detection_count = 0
+
+        # Audio buffer for ensemble detector (processes full audio at once)
+        self.audio_buffer = np.array([], dtype=np.int16)
+        self.window_samples = int(sample_rate * window_duration_ms / 1000)
+
+        if self.use_ensemble:
+            print("\n[DETECTOR] Initializing Ensemble Detector (YAMNet + Frequency + Energy)")
+            try:
+                self.detector = EnsembleBeepDetector(
+                    yamnet_weight=ensemble_yamnet_weight,
+                    frequency_weight=ensemble_frequency_weight,
+                    energy_weight=ensemble_energy_weight,
+                    threshold=ensemble_threshold,
+                )
+                print(f"[DETECTOR] Ensemble detector initialized successfully")
+                print(f"[DETECTOR] Threshold: {ensemble_threshold}")
+            except Exception as e:
+                print(f"[ERROR] Failed to initialize ensemble detector: {e}")
+                print(f"[ERROR] Falling back to legacy NeuralBeepDetector")
+                self.use_ensemble = False
+
+        if not self.use_ensemble:
+            print("\n[DETECTOR] Initializing Legacy NeuralBeepDetector")
+            self.detector = NeuralBeepDetector(
+                model_path=legacy_model_path,
+                sample_rate=sample_rate,
+                window_duration_ms=window_duration_ms,
+                confidence_threshold=legacy_confidence_threshold,
+            )
+            print(f"[DETECTOR] Legacy detector initialized")
+
+    def detect(self, samples: np.ndarray) -> dict:
+        """
+        Run detection on audio samples.
+
+        Args:
+            samples: Audio samples (int16 numpy array)
+
+        Returns:
+            Dictionary with detection results:
+            - detected: bool (is beep detected)
+            - confidence: float (0.0-1.0 confidence score)
+            - components: dict (ensemble component scores, if using ensemble)
+            - buffering: bool (if still buffering audio)
+        """
+        if self.use_ensemble:
+            return self._detect_ensemble(samples)
+        else:
+            return self.detector.detect(samples)
+
+    def _detect_ensemble(self, samples: np.ndarray) -> dict:
+        """Run ensemble detection on audio samples."""
+        # Accumulate audio in buffer
+        self.audio_buffer = np.concatenate([self.audio_buffer, samples])
+
+        # Need enough audio for meaningful detection
+        if len(self.audio_buffer) < self.window_samples:
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "buffering": True,
+                "components": {}
+            }
+
+        # Use most recent window
+        window = self.audio_buffer[-self.window_samples:]
+
+        # Convert to float32 for ensemble detector
+        audio_float = window.astype(np.float32) / 32768.0
+
+        # Run ensemble detection
+        try:
+            ensemble_score, components = self.detector.detect_beep(
+                audio_float,
+                self.sample_rate
+            )
+
+            is_beep = components['is_beep']
+
+            if is_beep:
+                self.detection_count += 1
+
+            # Keep buffer size manageable (2x window)
+            max_buffer = self.window_samples * 2
+            if len(self.audio_buffer) > max_buffer:
+                self.audio_buffer = self.audio_buffer[-max_buffer:]
+
+            return {
+                "detected": is_beep,
+                "confidence": ensemble_score,
+                "components": components,
+                "buffering": False,
+            }
+
+        except Exception as e:
+            print(f"[ERROR] Ensemble detection failed: {e}")
+            return {
+                "detected": False,
+                "confidence": 0.0,
+                "error": str(e),
+                "buffering": False,
+            }
+
+    def reload_model(self, model_path: str = None):
+        """Reload model (only for legacy detector)."""
+        if not self.use_ensemble and hasattr(self.detector, 'reload_model'):
+            self.detector.reload_model(model_path)
+        else:
+            print("[WARNING] Model reload not supported for ensemble detector")
+
+    def get_config(self) -> dict:
+        """Get detector configuration."""
+        config = {
+            "type": "ensemble" if self.use_ensemble else "legacy",
+            "sample_rate": self.sample_rate,
+            "window_duration_ms": self.window_duration_ms,
+        }
+
+        if self.use_ensemble and hasattr(self.detector, 'get_config'):
+            config["ensemble"] = self.detector.get_config()
+
+        return config
+
+
+# ============================================
 # Audio Stream Server with Web Dashboard
 # ============================================
 
@@ -3096,6 +3273,11 @@ class AudioStreamServer:
         window_ms: int = 500,
         confidence_threshold: float = 0.5,
         web_port: int = 8080,
+        use_ensemble: bool = True,
+        ensemble_threshold: float = 0.35,
+        ensemble_yamnet_weight: float = 0.6,
+        ensemble_frequency_weight: float = 0.2,
+        ensemble_energy_weight: float = 0.2,
     ):
         self.port = port
         self.response_port = response_port
@@ -3103,12 +3285,17 @@ class AudioStreamServer:
         self.record_dir = record_dir
         self.web_port = web_port
 
-        # Create neural network detector
-        self.nn_detector = NeuralBeepDetector(
-            model_path=model_path,
+        # Create unified detector (ensemble or legacy)
+        self.nn_detector = UnifiedBeepDetector(
+            use_ensemble=use_ensemble,
+            ensemble_threshold=ensemble_threshold,
+            ensemble_yamnet_weight=ensemble_yamnet_weight,
+            ensemble_frequency_weight=ensemble_frequency_weight,
+            ensemble_energy_weight=ensemble_energy_weight,
+            legacy_model_path=model_path,
+            legacy_confidence_threshold=confidence_threshold,
             sample_rate=sample_rate,
             window_duration_ms=window_ms,
-            confidence_threshold=confidence_threshold,
         )
 
         # UDP sockets
@@ -3574,9 +3761,10 @@ class AudioStreamServer:
         if not nn_result.get("buffering", False):
             detected = nn_result["detected"]
             confidence = nn_result["confidence"]
+            components = nn_result.get("components", {})
             self.current_confidence = confidence
 
-            self._print_status(sequence, confidence, detected)
+            self._print_status(sequence, confidence, detected, components)
 
             if detected != self.last_detection_state or (detected and confidence > 0.9):
                 self._send_detection_to_esp32(detected, confidence)
@@ -3619,11 +3807,11 @@ class AudioStreamServer:
         if self.recording:
             self.record_buffer.append(samples)
 
-    def _print_status(self, seq: int, confidence: float, detected: bool):
+    def _print_status(self, seq: int, confidence: float, detected: bool, components: dict = None):
         """Print real-time NN detection status."""
         if detected:
             color = "\033[92m"
-        elif confidence > self.nn_detector.confidence_threshold * 0.7:
+        elif confidence > 0.25:  # Reasonable threshold for ensemble
             color = "\033[93m"
         else:
             color = "\033[0m"
@@ -3632,10 +3820,22 @@ class AudioStreamServer:
         bar = "#" * bar_len + "-" * (50 - bar_len)
 
         status = "BEEP!" if detected else "     "
-        print(
-            f"{color}seq={seq:8d} | conf={confidence:.3f} | [{bar}] {status}\033[0m",
-            end="\r",
-        )
+
+        # If ensemble detector, show component scores
+        if components and 'yamnet' in components:
+            yamnet_score = components.get('yamnet', 0.0)
+            freq_score = components.get('frequency', 0.0)
+            energy_score = components.get('energy', 0.0)
+            print(
+                f"{color}seq={seq:8d} | ens={confidence:.3f} | Y:{yamnet_score:.2f} F:{freq_score:.2f} E:{energy_score:.2f} | [{bar}] {status}\033[0m",
+                end="\r",
+            )
+        else:
+            # Legacy display format
+            print(
+                f"{color}seq={seq:8d} | conf={confidence:.3f} | [{bar}] {status}\033[0m",
+                end="\r",
+            )
 
     def _print_stats(self):
         """Print periodic statistics."""
@@ -3739,11 +3939,37 @@ Examples:
     )
     parser.add_argument(
         "--confidence-threshold", type=float, default=0.7,
-        help="Confidence threshold for NN detection (default: 0.7)",
+        help="Confidence threshold for legacy NN detection (default: 0.7)",
     )
     parser.add_argument(
         "--test-file", type=str, default=None,
         help="Test detection on an audio file instead of live UDP stream",
+    )
+
+    # Ensemble detector options
+    parser.add_argument(
+        "--use-ensemble", action="store_true", default=True,
+        help="Use ensemble detector (YAMNet + Frequency + Energy) instead of legacy model (default: True)",
+    )
+    parser.add_argument(
+        "--no-ensemble", action="store_false", dest="use_ensemble",
+        help="Use legacy NeuralBeepDetector instead of ensemble detector",
+    )
+    parser.add_argument(
+        "--ensemble-threshold", type=float, default=0.35,
+        help="Detection threshold for ensemble detector (default: 0.35)",
+    )
+    parser.add_argument(
+        "--yamnet-weight", type=float, default=0.6,
+        help="Weight for YAMNet component in ensemble (default: 0.6)",
+    )
+    parser.add_argument(
+        "--frequency-weight", type=float, default=0.2,
+        help="Weight for frequency detector in ensemble (default: 0.2)",
+    )
+    parser.add_argument(
+        "--energy-weight", type=float, default=0.2,
+        help="Weight for energy detector in ensemble (default: 0.2)",
     )
 
     args = parser.parse_args()
@@ -3764,6 +3990,11 @@ Examples:
         window_ms=args.window_ms,
         confidence_threshold=args.confidence_threshold,
         web_port=args.web_port,
+        use_ensemble=args.use_ensemble,
+        ensemble_threshold=args.ensemble_threshold,
+        ensemble_yamnet_weight=args.yamnet_weight,
+        ensemble_frequency_weight=args.frequency_weight,
+        ensemble_energy_weight=args.energy_weight,
     )
 
     server.start()
