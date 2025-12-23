@@ -67,7 +67,7 @@ class AudioStreamerComponent : public Component {
 
   // Timing
   uint32_t last_stats_time_{0};
-  static const uint32_t STATS_INTERVAL_MS = 5000;
+  static const uint32_t STATS_INTERVAL_MS = 60000;  // Log stats every 60s instead of 5s
 };
 
 }  // namespace audio_streamer
