@@ -44,23 +44,18 @@ from pathlib import Path
 
 import numpy as np
 
-# Try to import TFLite runtime first (smaller, no AVX required)
-# Fall back to full TensorFlow if TFLite not available
+# Use TFLite runtime for inference (works on CPUs without AVX)
+# Do NOT import TensorFlow here - it requires AVX instructions
 TFLITE_AVAILABLE = False
-TF_AVAILABLE = False
 
 try:
     import tflite_runtime.interpreter as tflite
     TFLITE_AVAILABLE = True
     print("[INFO] Using TFLite runtime for inference (no AVX required)")
-except ImportError:
-    try:
-        import tensorflow as tf
-        TF_AVAILABLE = True
-        print("[INFO] Using TensorFlow for inference")
-    except Exception as e:
-        print(f"[WARNING] Neither tflite-runtime nor tensorflow available: {e}")
-        print("[WARNING] Model inference will be disabled")
+except ImportError as e:
+    print(f"[WARNING] tflite-runtime not available: {e}")
+    print("[WARNING] Model inference will be disabled")
+    print("[WARNING] Install with: pip install tflite-runtime")
 
 # Flask for web dashboard
 try:
@@ -793,23 +788,11 @@ class NeuralBeepDetector:
             except Exception as e:
                 print(f"  TFLite load failed: {e}")
 
-        # Fall back to TensorFlow/Keras
-        if TF_AVAILABLE:
-            try:
-                tf.get_logger().setLevel('ERROR')
-                if os.path.exists(model_path):
-                    self.model = tf.keras.models.load_model(model_path)
-                    print(f"  Keras model loaded: {model_path}")
-                else:
-                    print(f"  WARNING: Model not found at {model_path}")
-                    print(f"  Run train_beep_model.py first!")
-            except Exception as e:
-                print(f"  ERROR loading Keras model: {e}")
-                self.model = None
-        else:
-            print(f"  WARNING: No model backend available")
-            print(f"  Install tflite-runtime or tensorflow")
-            self.model = None
+        # TFLite is required - TensorFlow not supported due to AVX requirement
+        print(f"  WARNING: TFLite model not found or failed to load")
+        print(f"  TFLite runtime is required for legacy detector on this CPU")
+        print(f"  Install with: pip install tflite-runtime")
+        self.model = None
 
     def reload_model(self, model_path: str = None):
         """Hot-reload the model (for active learning updates)."""

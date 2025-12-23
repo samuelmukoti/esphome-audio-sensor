@@ -6,12 +6,11 @@ librosa>=0.10.0
 soundfile>=0.12.0
 flask>=2.3.0
 
-# Ensemble Detector Dependencies
-# TensorFlow for YAMNet model and full training support
-tensorflow>=2.14.0
-# TensorFlow Hub for loading pre-trained models like YAMNet
-tensorflow-hub>=0.15.0
+# Ensemble Detector Dependencies (only for CPUs with AVX support)
+# TensorFlow for YAMNet model and full training support (requires AVX)
+# tensorflow>=2.14.0
+# TensorFlow Hub for loading pre-trained models like YAMNet (requires AVX)
+# tensorflow-hub>=0.15.0
 
-# Legacy support: TFLite runtime for inference-only deployments (optional)
-# Uncomment if you want to use the legacy NeuralBeepDetector with TFLite
-# tflite-runtime>=2.14.0
+# TFLite runtime for inference-only deployments (works on legacy CPUs without AVX)
+tflite-runtime>=2.14.0
