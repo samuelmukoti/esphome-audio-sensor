@@ -38,17 +38,17 @@ EXPOSE 8080
 ENV AUDIO_PORT=5050
 ENV WEB_PORT=8080
 ENV CONFIDENCE_THRESHOLD=0.7
-ENV USE_ENSEMBLE=true
+# Ensemble detector disabled by default (requires AVX CPU instructions)
+ENV USE_ENSEMBLE=false
 ENV ENSEMBLE_THRESHOLD=0.35
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:${WEB_PORT}/api/status || exit 1
 
-# Run the server with ensemble detector enabled by default
-# Use --no-ensemble flag to fall back to legacy detector
+# Run the server with legacy detector (ensemble requires AVX CPU instructions)
+# Use --use-ensemble flag if CPU supports AVX/AVX2
 CMD ["python", "-u", "audio_server.py", \
      "--port", "5050", \
      "--web-port", "8080", \
-     "--use-ensemble", \
-     "--ensemble-threshold", "0.35"]
+     "--no-ensemble"]
