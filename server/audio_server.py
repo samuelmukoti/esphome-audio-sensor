@@ -809,7 +809,9 @@ class NeuralBeepDetector:
         """Extract MFCC features from audio samples."""
         import librosa
 
-        y = samples.astype(np.float32) / 32768.0
+        # Remove DC offset before normalization (critical for detection accuracy!)
+        samples_centered = samples - np.mean(samples)
+        y = samples_centered.astype(np.float32) / 32768.0
         hop_length = int(self.sample_rate * self.hop_duration_ms / 1000)
         mfcc = librosa.feature.mfcc(
             y=y,
@@ -3188,8 +3190,9 @@ class UnifiedBeepDetector:
         # Use most recent window
         window = self.audio_buffer[-self.window_samples:]
 
-        # Convert to float32 for ensemble detector
-        audio_float = window.astype(np.float32) / 32768.0
+        # Remove DC offset before normalization (critical for detection accuracy!)
+        window_centered = window - np.mean(window)
+        audio_float = window_centered.astype(np.float32) / 32768.0
 
         # Run ensemble detection
         try:
