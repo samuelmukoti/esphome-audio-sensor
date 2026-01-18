@@ -3794,7 +3794,11 @@ class AudioStreamServer:
                 samples = list(self.continuous_buffer)[-chunk_size:]
                 next_cursor = self.audio_write_position
 
-            audio_data = np.array(samples, dtype=np.int16)
+            audio_data = np.array(samples, dtype=np.float32)
+            # Remove DC offset for clean playback (raw audio has ~1300 DC bias from mic)
+            audio_data = audio_data - np.mean(audio_data)
+            # Clip and convert back to int16
+            audio_data = np.clip(audio_data, -32768, 32767).astype(np.int16)
             return jsonify({
                 'audio': base64.b64encode(audio_data.tobytes()).decode(),
                 'sample_rate': self.sample_rate,
