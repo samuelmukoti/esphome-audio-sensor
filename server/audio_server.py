@@ -1347,6 +1347,27 @@ DASHBOARD_HTML = '''
             color: #000;
             font-weight: bold;
         }
+        .audio-toggle-btn {
+            padding: 8px 12px;
+            border: none;
+            border-radius: 8px;
+            background: #16213e;
+            color: #aaa;
+            cursor: pointer;
+            font-size: 1.1em;
+            transition: all 0.2s;
+            margin-left: 10px;
+        }
+        .audio-toggle-btn:hover { background: #1a3a5c; color: #fff; }
+        .audio-toggle-btn.active {
+            background: linear-gradient(135deg, #00ff88, #00cc66);
+            color: #000;
+            animation: pulse-audio 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse-audio {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.4); }
+            50% { box-shadow: 0 0 0 8px rgba(0, 255, 136, 0); }
+        }
         .nav-status {
             display: flex;
             align-items: center;
@@ -1719,6 +1740,9 @@ DASHBOARD_HTML = '''
                     📁 Dataset
                 </button>
             </div>
+            <button class="audio-toggle-btn" id="audio-toggle-btn" onclick="toggleLiveAudio()" title="Toggle live audio playback">
+                🔇
+            </button>
             <div class="nav-status">
                 <div class="status-dot" id="nav-status-dot"></div>
                 <span id="nav-status-text">Connecting...</span>
@@ -2042,6 +2066,198 @@ DASHBOARD_HTML = '''
     </div><!-- End container -->
 
     <script>
+        // Live audio playback state
+        let audioContext = null;
+        let gainNode = null;
+        let isLiveAudioEnabled = false;
+        let audioFetchInterval = null;
+        let nextPlayTime = 0;
+
+        // Buffered playback state
+        let audioQueue = [];
+        let isBuffering = true;
+        let audioReadCursor = null;
+        const PRE_BUFFER_MS = 500;  // Buffer 500ms before starting playback
+        const CHUNK_MS = 100;  // Each chunk is ~100ms
+
+        function toggleLiveAudio() {
+            isLiveAudioEnabled = !isLiveAudioEnabled;
+            const btn = document.getElementById('audio-toggle-btn');
+
+            if (isLiveAudioEnabled) {
+                // Pause spectrum visualization to save resources
+                pauseSpectrumVisualization();
+                startLiveAudioPlayback();
+                btn.textContent = '🔊';
+                btn.classList.add('active');
+                btn.title = 'Live audio ON - click to mute (spectrum paused)';
+            } else {
+                stopLiveAudioPlayback();
+                // Resume spectrum visualization
+                resumeSpectrumVisualization();
+                btn.textContent = '🔇';
+                btn.classList.remove('active');
+                btn.title = 'Toggle live audio playback';
+            }
+        }
+
+        async function startLiveAudioPlayback() {
+            try {
+                // Create audio context with browser's native sample rate
+                // Web Audio API will resample from 16kHz source automatically
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+                // Resume context if suspended (required by browser autoplay policy)
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                console.log('AudioContext state:', audioContext.state, 'native sampleRate:', audioContext.sampleRate);
+
+                // Create gain node to boost volume (mic audio can be quiet)
+                gainNode = audioContext.createGain();
+                gainNode.gain.value = 3.0; // Boost volume 3x
+                gainNode.connect(audioContext.destination);
+
+                nextPlayTime = audioContext.currentTime;
+
+                // Reset buffering state
+                audioQueue = [];
+                isBuffering = true;
+                audioReadCursor = null;  // Will be set by first server response
+                updateBufferingIndicator(true);
+
+                // Start fetching audio chunks
+                audioFetchInterval = setInterval(fetchAndPlayAudioChunk, 100);
+                console.log('Live audio playback started (buffering...)');
+            } catch (err) {
+                console.error('Failed to start audio playback:', err);
+                isLiveAudioEnabled = false;
+                document.getElementById('audio-toggle-btn').textContent = '🔇';
+                document.getElementById('audio-toggle-btn').classList.remove('active');
+                updateBufferingIndicator(false);
+            }
+        }
+
+        function updateBufferingIndicator(buffering) {
+            const btn = document.getElementById('audio-toggle-btn');
+            if (buffering && isLiveAudioEnabled) {
+                btn.textContent = '⏳';
+                btn.title = 'Buffering audio...';
+            } else if (isLiveAudioEnabled) {
+                btn.textContent = '🔊';
+                btn.title = 'Live audio ON - click to mute';
+            }
+        }
+
+        function stopLiveAudioPlayback() {
+            if (audioFetchInterval) {
+                clearInterval(audioFetchInterval);
+                audioFetchInterval = null;
+            }
+            if (gainNode) {
+                gainNode.disconnect();
+                gainNode = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            nextPlayTime = 0;
+            // Reset buffering state
+            audioQueue = [];
+            isBuffering = true;
+            audioReadCursor = null;
+            updateBufferingIndicator(false);
+            console.log('Live audio playback stopped');
+        }
+
+        async function fetchAndPlayAudioChunk() {
+            if (!audioContext || !isLiveAudioEnabled) return;
+
+            try {
+                // Build URL with cursor for sequential reads
+                let url = '/api/audio-stream';
+                if (audioReadCursor !== null) {
+                    url += '?cursor=' + audioReadCursor;
+                }
+
+                const response = await fetch(url);
+                const data = await response.json();
+
+                if (data.audio) {
+                    // Update cursor for next fetch
+                    if (data.next_cursor !== undefined) {
+                        audioReadCursor = data.next_cursor;
+                    }
+
+                    // Decode base64 to ArrayBuffer
+                    const binaryString = atob(data.audio);
+                    const bytes = new Uint8Array(binaryString.length);
+                    for (let i = 0; i < binaryString.length; i++) {
+                        bytes[i] = binaryString.charCodeAt(i);
+                    }
+
+                    // Convert int16 to float32 for Web Audio API
+                    const int16Array = new Int16Array(bytes.buffer);
+                    const float32Array = new Float32Array(int16Array.length);
+                    for (let i = 0; i < int16Array.length; i++) {
+                        float32Array[i] = int16Array[i] / 32768.0;
+                    }
+
+                    // Create audio buffer
+                    const audioBuffer = audioContext.createBuffer(1, float32Array.length, data.sample_rate);
+                    audioBuffer.getChannelData(0).set(float32Array);
+
+                    // If still buffering, queue the chunk
+                    if (isBuffering) {
+                        audioQueue.push(audioBuffer);
+                        const bufferedMs = audioQueue.length * CHUNK_MS;
+                        console.log(`Buffering: ${bufferedMs}ms / ${PRE_BUFFER_MS}ms`);
+
+                        // Check if we have enough buffered
+                        if (bufferedMs >= PRE_BUFFER_MS) {
+                            isBuffering = false;
+                            updateBufferingIndicator(false);
+                            console.log('Buffer ready, starting playback');
+                            // Play all queued audio
+                            nextPlayTime = audioContext.currentTime;
+                            while (audioQueue.length > 0) {
+                                const buf = audioQueue.shift();
+                                scheduleAudioBuffer(buf);
+                            }
+                        }
+                        return;
+                    }
+
+                    // Normal playback - schedule immediately
+                    scheduleAudioBuffer(audioBuffer);
+                }
+            } catch (err) {
+                // Silently ignore fetch errors (may happen if server is busy)
+                console.debug('Audio fetch error:', err);
+            }
+        }
+
+        function scheduleAudioBuffer(audioBuffer) {
+            if (!audioContext || !gainNode) return;
+
+            const source = audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(gainNode);
+
+            // Schedule to play at next available time
+            const now = audioContext.currentTime;
+            if (nextPlayTime < now) {
+                // If we've fallen behind, reset to now (will cause a gap but prevent buildup)
+                if (now - nextPlayTime > 0.5) {
+                    console.log('Audio playback fell behind, resetting');
+                }
+                nextPlayTime = now;
+            }
+            source.start(nextPlayTime);
+            nextPlayTime += audioBuffer.duration;
+        }
+
         let trainingMode = false;
 
         function toggleTraining() {
@@ -2365,8 +2581,23 @@ DASHBOARD_HTML = '''
                 .catch(() => {});
         }
 
-        // Update spectrum at ~20 FPS
-        setInterval(fetchSpectrum, 50);
+        // Update spectrum at ~20 FPS (stored so we can pause during audio playback)
+        let spectrumIntervalId = setInterval(fetchSpectrum, 50);
+
+        function pauseSpectrumVisualization() {
+            if (spectrumIntervalId) {
+                clearInterval(spectrumIntervalId);
+                spectrumIntervalId = null;
+                console.log('Spectrum visualization paused');
+            }
+        }
+
+        function resumeSpectrumVisualization() {
+            if (!spectrumIntervalId) {
+                spectrumIntervalId = setInterval(fetchSpectrum, 50);
+                console.log('Spectrum visualization resumed');
+            }
+        }
 
         // ========================================
         // Training Dataset Management
@@ -3301,6 +3532,7 @@ class AudioStreamServer:
         self.recording = False
         self.record_buffer: list = []
         self.continuous_buffer = deque(maxlen=sample_rate * 60)
+        self.audio_write_position = 0  # Total samples written (for cursor tracking)
 
         # Statistics
         self.packets_received = 0
@@ -3343,6 +3575,66 @@ class AudioStreamServer:
                 "detecting": self.last_detection_state,
                 "confidence": self.current_confidence,
                 "training_mode": self.training_mode,
+            })
+
+        @self.flask_app.route('/api/packet-stats')
+        def api_packet_stats():
+            """Return detailed packet loss statistics for diagnostics."""
+            elapsed = time.time() - self.start_time if self.start_time else 0
+            total_expected = self.packets_received + self.packets_lost
+
+            # Calculate rates
+            pps = self.packets_received / elapsed if elapsed > 0 else 0
+            kbps = (self.bytes_received * 8 / 1000) / elapsed if elapsed > 0 else 0
+            loss_pct = (self.packets_lost / total_expected * 100) if total_expected > 0 else 0
+
+            # Expected rate: 16kHz / 256 samples per packet = 62.5 packets/sec
+            expected_pps = 62.5
+            actual_vs_expected = (pps / expected_pps * 100) if expected_pps > 0 else 0
+
+            # Generate recommendations
+            recommendations = []
+            if loss_pct > 50:
+                recommendations.append("CRITICAL: >50% packet loss. Check WiFi signal, reduce chunk_size, or increase UDP buffer.")
+            elif loss_pct > 20:
+                recommendations.append("HIGH: 20-50% packet loss. May affect detection accuracy.")
+            elif loss_pct > 5:
+                recommendations.append("MODERATE: 5-20% packet loss. Some audio gaps expected.")
+
+            if pps < expected_pps * 0.6:
+                recommendations.append(f"LOW RATE: Receiving {pps:.1f} pkt/s vs expected {expected_pps:.1f}. Network or ESP32 issue.")
+
+            if not recommendations:
+                recommendations.append("OK: Packet loss is within acceptable range.")
+
+            return jsonify({
+                "connected": self.esp32_addr is not None,
+                "esp32_ip": self.esp32_addr[0] if self.esp32_addr else None,
+                "uptime_seconds": round(elapsed, 1),
+                "packets": {
+                    "received": self.packets_received,
+                    "lost": self.packets_lost,
+                    "total_expected": total_expected,
+                    "loss_percent": round(loss_pct, 2),
+                },
+                "rates": {
+                    "packets_per_sec": round(pps, 2),
+                    "expected_pps": expected_pps,
+                    "actual_vs_expected_percent": round(actual_vs_expected, 1),
+                    "kbps": round(kbps, 2),
+                },
+                "buffer": {
+                    "current_samples": len(self.continuous_buffer),
+                    "max_samples": self.continuous_buffer.maxlen,
+                    "write_position": self.audio_write_position,
+                    "buffer_seconds": round(len(self.continuous_buffer) / self.sample_rate, 2),
+                },
+                "detection": {
+                    "nn_inferences": self.nn_inferences,
+                    "nn_rate": round(self.nn_inferences / elapsed, 1) if elapsed > 0 else 0,
+                    "detection_count": self.nn_detector.detection_count if hasattr(self.nn_detector, 'detection_count') else 0,
+                },
+                "recommendations": recommendations
             })
 
         @self.flask_app.route('/api/events')
@@ -3453,6 +3745,62 @@ class AudioStreamServer:
             if os.path.exists(audio_path):
                 return send_file(audio_path, mimetype='audio/wav')
             return "Not found", 404
+
+        @self.flask_app.route('/api/audio-stream')
+        def api_audio_stream():
+            """Return live audio chunk for browser playback with cursor support."""
+            import base64
+
+            # ~100ms of audio (1600 samples at 16kHz)
+            chunk_size = 1600
+            buffer_len = len(self.continuous_buffer)
+
+            if buffer_len < chunk_size:
+                return jsonify({'audio': None, 'error': 'Not enough audio buffered'})
+
+            cursor = request.args.get('cursor', type=int)
+
+            if cursor is not None:
+                # Cursor-based read: return sequential chunk from cursor position
+                # Calculate how far back from the current write position
+                samples_behind = self.audio_write_position - cursor
+
+                if samples_behind <= 0:
+                    # Client is caught up or ahead, return empty
+                    return jsonify({
+                        'audio': None,
+                        'waiting': True,
+                        'next_cursor': cursor
+                    })
+
+                if samples_behind > buffer_len:
+                    # Client cursor is too old (data was overwritten), reset to recent
+                    samples_behind = min(chunk_size * 5, buffer_len)  # Give them some buffer
+                    cursor = self.audio_write_position - samples_behind
+
+                # Get the chunk starting from cursor position
+                # samples_behind = how far back the cursor is from current write position
+                # We want to read chunk_size samples starting from (buffer_end - samples_behind)
+                start_offset = buffer_len - samples_behind
+                end_offset = min(start_offset + chunk_size, buffer_len)
+                actual_chunk = end_offset - start_offset
+
+                buffer_list = list(self.continuous_buffer)
+                samples = buffer_list[start_offset:end_offset]
+                next_cursor = cursor + actual_chunk
+            else:
+                # No cursor: legacy behavior - return tail and provide initial cursor
+                samples = list(self.continuous_buffer)[-chunk_size:]
+                next_cursor = self.audio_write_position
+
+            audio_data = np.array(samples, dtype=np.int16)
+            return jsonify({
+                'audio': base64.b64encode(audio_data.tobytes()).decode(),
+                'sample_rate': self.sample_rate,
+                'samples': len(samples),
+                'next_cursor': next_cursor,
+                'write_position': self.audio_write_position
+            })
 
         @self.flask_app.route('/api/spectrum')
         def api_spectrum():
@@ -3746,6 +4094,7 @@ class AudioStreamServer:
         self.packets_received += 1
         self.bytes_received += len(data)
         self.continuous_buffer.extend(samples)
+        self.audio_write_position += len(samples)  # Track for cursor-based reads
 
         nn_result = self.nn_detector.detect(samples)
         self.nn_inferences += 1
