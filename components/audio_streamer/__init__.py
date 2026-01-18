@@ -11,6 +11,8 @@ CONF_TARGET_PORT = "target_port"
 CONF_SAMPLE_RATE = "sample_rate"
 CONF_ENABLED = "enabled"
 CONF_CHUNK_SIZE = "chunk_size"
+CONF_BATCH_COUNT = "batch_count"
+CONF_SEND_INTERVAL_MS = "send_interval_ms"
 
 audio_streamer_ns = cg.esphome_ns.namespace("audio_streamer")
 AudioStreamerComponent = audio_streamer_ns.class_(
@@ -26,6 +28,9 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_SAMPLE_RATE, default=16000): cv.positive_int,
         cv.Optional(CONF_ENABLED, default=False): cv.boolean,
         cv.Optional(CONF_CHUNK_SIZE, default=512): cv.positive_int,
+        # Flow control options to prevent WiFi buffer exhaustion
+        cv.Optional(CONF_BATCH_COUNT, default=4): cv.int_range(min=1, max=16),  # Batch N reads before sending
+        cv.Optional(CONF_SEND_INTERVAL_MS, default=50): cv.int_range(min=10, max=500),  # Min ms between sends
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -42,3 +47,5 @@ async def to_code(config):
     cg.add(var.set_sample_rate(config[CONF_SAMPLE_RATE]))
     cg.add(var.set_enabled(config[CONF_ENABLED]))
     cg.add(var.set_chunk_size(config[CONF_CHUNK_SIZE]))
+    cg.add(var.set_batch_count(config[CONF_BATCH_COUNT]))
+    cg.add(var.set_send_interval_ms(config[CONF_SEND_INTERVAL_MS]))

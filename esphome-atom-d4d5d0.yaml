@@ -4,13 +4,12 @@ esphome:
   min_version: 2025.9.0
   name_add_mac_suffix: false
 
-# Load custom components from GitHub repository
+# Load custom components from local directory (for development)
 # Off-device inference: ESP32 streams audio, server does NN detection, sends result back
 external_components:
   - source:
-      type: git
-      url: https://github.com/samuelmukoti/esphome-audio-sensor
-      ref: main
+      type: local
+      path: components
     components: [audio_streamer, detection_receiver]
 
 esp32:
@@ -67,10 +66,12 @@ microphone:
 audio_streamer:
   id: audio_streamer_component
   microphone: echo_microphone
-  target_ip: "192.168.86.10" # Server running audio_server.py
+  target_ip: "192.168.86.10" # Docker host machine for production
   target_port: 5050 # Server listens on this port
   sample_rate: 16000
-  chunk_size: 256 # Reduced from 512 - smaller packets = better WiFi reliability
+  # Flow control to prevent WiFi buffer exhaustion (errno 12)
+  batch_count: 4      # Batch 4 mic reads (~64ms) into one packet
+  send_interval_ms: 50  # Max 20 packets/sec (was 62.5)
 
 # Detection Receiver: Receives NN detection results from server
 detection_receiver:

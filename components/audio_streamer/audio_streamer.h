@@ -26,6 +26,8 @@ class AudioStreamerComponent : public Component {
   void set_sample_rate(uint32_t rate) { this->sample_rate_ = rate; }
   void set_enabled(bool enabled) { this->enabled_ = enabled; }
   void set_chunk_size(uint16_t size) { this->chunk_size_ = size; }
+  void set_batch_count(uint8_t count) { this->batch_count_ = count; }  // How many mic reads to batch
+  void set_send_interval_ms(uint32_t ms) { this->send_interval_ms_ = ms; }  // Min interval between sends
 
   // Runtime control (callable from Home Assistant)
   void start_streaming();
@@ -55,18 +57,24 @@ class AudioStreamerComponent : public Component {
   uint32_t sample_rate_{16000};
   bool enabled_{false};
   uint16_t chunk_size_{512};
+  uint8_t batch_count_{4};  // Batch 4 mic reads (~64ms) before sending
+  uint32_t send_interval_ms_{50};  // Min 50ms between sends = max 20 pkt/s
 
   // State
   bool streaming_active_{false};
   uint32_t sequence_number_{0};
   uint32_t packets_sent_{0};
   uint32_t bytes_sent_{0};
+  uint32_t packets_dropped_{0};  // Dropped due to buffer full
+  uint8_t batch_counter_{0};  // Current batch accumulation count
 
   // Buffer for accumulating samples
   std::vector<uint8_t> send_buffer_;
+  std::vector<uint8_t> accumulation_buffer_;  // Buffer for batching multiple reads
 
   // Timing
   uint32_t last_stats_time_{0};
+  uint32_t last_send_time_{0};  // For send interval throttling
   static const uint32_t STATS_INTERVAL_MS = 60000;  // Log stats every 60s instead of 5s
 };
 

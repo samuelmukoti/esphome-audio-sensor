@@ -3588,8 +3588,9 @@ class AudioStreamServer:
             kbps = (self.bytes_received * 8 / 1000) / elapsed if elapsed > 0 else 0
             loss_pct = (self.packets_lost / total_expected * 100) if total_expected > 0 else 0
 
-            # Expected rate: 16kHz / 256 samples per packet = 62.5 packets/sec
-            expected_pps = 62.5
+            # Expected rate with flow control: batch_count=4, send_interval_ms=50 → ~20 pkt/s
+            # (Previously 62.5 pkt/s without batching, caused WiFi buffer exhaustion)
+            expected_pps = 20.0
             actual_vs_expected = (pps / expected_pps * 100) if expected_pps > 0 else 0
 
             # Generate recommendations
